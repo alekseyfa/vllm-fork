@@ -139,6 +139,7 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.split_qk_v = cache_config.split_qk_v
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -148,6 +149,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            split_qk_v=self.split_qk_v,
         )
 
         self.o_proj = RowParallelLinear(
@@ -186,8 +188,12 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.split_qk_v:
+            q, k, v, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
@@ -320,6 +326,8 @@ class LlamaModel(nn.Module):
             self.config_hidden_layers = int(
                 os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
 
+        self.split_qk_v = cache_config.split_qk_v
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -369,11 +377,14 @@ class LlamaModel(nn.Module):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+        if self.split_qk_v:
+            stacked_params_mapping.append((".qkv_proj.v_proj", ".v_proj", "v"))
+            stacked_params_mapping.append((".qkv_proj.k_proj", ".k_proj", "k"))
+        else:
+            stacked_params_mapping.append((".qkv_proj", ".v_proj", "v"))
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -406,7 +417,11 @@ class LlamaModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if self.split_qk_v and (shard_id == "v" or shard_id == "k") :
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
+
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
