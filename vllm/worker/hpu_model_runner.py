@@ -289,11 +289,11 @@ class HpuModelAdapter:
                                                 and not is_fake_hpu()
         self.block_size = block_size
         self.dtype = dtype
-        if not is_fake_hpu() and not htorch.utils.internal.is_lazy(
-        ) and not enforce_eager:
-            self.model = torch.compile(self.model,
-                                       backend='hpu_backend',
-                                       dynamic=False)
+        # if not is_fake_hpu() and not htorch.utils.internal.is_lazy(
+        # ) and not enforce_eager:
+        #     self.model = torch.compile(self.model,
+        #                                backend='hpu_backend',
+        #                                dynamic=False)
 
     def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device,
                        dtype):
