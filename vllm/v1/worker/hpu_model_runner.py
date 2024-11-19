@@ -3,7 +3,7 @@ import itertools
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -64,6 +64,125 @@ class DecodeInputData:
     position_ids: Optional[torch.Tensor] = None
     attn_metadata: HPUAttentionMetadata = None
     logits_indices: Optional[torch.Tensor] = None
+
+
+class Singleton(type):
+    _instances: Dict[type, object] = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super().__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+@dataclass
+class HPUBucketingGlobalState(metaclass=Singleton):
+    prompt_bs_bucket_cfg: Tuple[int, int, int] = field(init=False)
+    decode_bs_bucket_cfg: Tuple[int, int, int] = field(init=False)
+    prompt_seq_bucket_cfg: Tuple[int, int, int] = field(init=False)
+    decode_block_bucket_cfg: Tuple[int, int, int] = field(init=False)
+    prompt_buckets: List[Tuple[int, int]] = field(init=False)
+    decode_buckets: List[Tuple[int, int]] = field(init=False)
+
+
+def read_bucket_settings(phase: str, dim: str, **defaults):
+    """Read bucketing configuration from env variables.
+
+    phase is either 'prompt' or 'decode'
+    dim is either 'bs', 'seq' or 'block'
+    param is either 'min', 'step' or 'max'
+    example env variable: VLLM_DECODE_BS_BUCKET_STEP=128
+    """
+    params = ['min', 'step', 'max']
+    env_vars = [f'VLLM_{phase}_{dim}_BUCKET_{p}'.upper() for p in params]
+    default_values = [defaults[p] for p in params]
+    values = [
+        int(os.environ.get(e, d)) for e, d in zip(env_vars, default_values)
+    ]
+    for e, v, d in zip(env_vars, values, default_values):
+        logger.info('%s=%s (default:%s)', e, v, d)
+    return values
+
+
+
+def generate_prompt_buckets(bs_bucket_config,
+                            seq_bucket_config,
+                            max_num_batched_tokens=None):
+    buckets = list(
+        itertools.product(warmup_range(bs_bucket_config),
+                          warmup_range(seq_bucket_config)))
+    if len(buckets) == 0:
+        msg = ("No buckets could be captured with following config "
+               f"(min, step, max_warmup): "
+               f"bs:{bs_bucket_config}, "
+               f"seq:{seq_bucket_config}")
+        raise ValueError(msg)
+
+    filtered_buckets = buckets
+    if max_num_batched_tokens is not None:
+        # Remove buckets exceeding batch token budget
+        filtered_buckets = list(
+            filter(
+                lambda bucket: bucket[0] * bucket[1] <= max_num_batched_tokens,
+                buckets))
+
+        if len(filtered_buckets) == 0:
+            # we can handle this if we ignore max_num_batched_tokens
+            min_bucket_bs, min_bucket_seq = min(buckets,
+                                                key=lambda b: (b[0] * b[1]))
+            min_reqd_budget = min_bucket_bs * min_bucket_seq
+            msg = (
+                "The current bucketing configuration "
+                f"(min, step, max_warmup): "
+                f"bs:{bs_bucket_config}, "
+                f"seq:{seq_bucket_config} cannot be used with specified "
+                f"max_num_batched_tokens ({max_num_batched_tokens}), as the "
+                f"smallest bucket ({min_reqd_budget}) would exceed token "
+                "budget. Please increase max_num_batched_tokens or decrease "
+                "bucket minimum Ignoring max_num_batched_tokens at risk of "
+                "out-of-memory errors.")
+            logger.error(msg)
+            return list(
+                sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0]))), []
+
+    captured_buckets = list(
+        sorted(filtered_buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
+    omitted_buckets = list(
+        sorted([x for x in buckets if x not in filtered_buckets]))
+    return captured_buckets, omitted_buckets
+
+
+def generate_decode_buckets(bs_bucket_config, blocks_bucket_config,
+                            max_blocks):
+    buckets = []
+    bs_buckets = warmup_range(bs_bucket_config)
+    block_buckets = warmup_range(blocks_bucket_config)
+    bmin, bstep, bmax = blocks_bucket_config
+    last_bucket = max_blocks
+    for bs in bs_buckets:
+        for blocks in block_buckets:
+            if blocks >= last_bucket:
+                buckets.append((bs, last_bucket))
+                break
+            buckets.append((bs, blocks))
+    return list(sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
+
+def next_pow2(value: int, base: int):
+    res = base
+    while value > 1:
+        value = (value + 1) // 2
+        res *= 2
+    return res
+
+
+def round_up(value: int, k: int):
+    return (value + k - 1) // k * k
+
+
+def find_bucket(value: int, config: Tuple[int, int, int]):
+    bmin, bstep, _ = config
+    next_step = round_up(value, bstep)
+    next_pow = next_pow2(value, bmin)
+    return max(bmin, min(next_step, next_pow))
 
 
 def flatten(in_list):
@@ -404,6 +523,8 @@ class HPUModelRunner:
 
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'true').lower() == 'true'
+        self.seen_configs: set = set()
+        
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -706,16 +827,6 @@ class HPUModelRunner:
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
         logits_indices = query_start_loc[1:] - 1
         # CPU<>HPU sync happens here.
-        #logger.info(f'decode token_ids: {token_ids}')
-        #logger.info(f'decode positions: {positions}')
-        #logger.info(f'decode logits_indices: {logits_indices}')
-        #logger.info(f'decode block_table: {block_tables_list}')
-        #logger.info(f'decode block_list: {block_list}')
-        #logger.info(f'decode block_usage: {block_usage}')
-        #logger.info(f'decode block_groups: {block_groups}')
-        #logger.info(
-        #    f'decode num_decode_tokens: {torch.sum(context_lens).item()}')
-        #logger.info(f'decode slot_mapping: {slot_mapping}')
         return DecodeInputData(
             num_decodes=num_decodes,
             token_ids=token_ids.to(self.device),
@@ -754,10 +865,29 @@ class HPUModelRunner:
             self._prepare_prefill_inputs(num_scheduled_tokens),
             self._prepare_decode_inputs(num_decodes, scheduler_output),
         )
-
+    
+    def _seq_len(self, attn_metadata):
+        if attn_metadata.num_prefills != 0:
+            return attn_metadata.slot_mapping.size(1)
+        else:
+            return attn_metadata.block_list.numel()
+        
+    def _check_config(self, batch_size, seq_len, is_prompt, warmup_mode):
+        cfg = (batch_size, seq_len, is_prompt)
+        seen = cfg in self.seen_configs
+        self.seen_configs.add(cfg)
+        if not seen and not warmup_mode:
+            phase = 'prompt' if is_prompt else 'decode'
+            logger.warning("Configuration: (%s, %s, %s) was not warmed-up!",
+                           phase, batch_size, seq_len)
+    
     def _execute_model_generic(self, token_ids, position_ids, attn_metadata,
                                logits_indices):
         # FORWARD.
+        batch_size = token_ids.size(0)
+        seq_len = self._seq_len(attn_metadata)
+        is_prompt = attn_metadata.is_prompt
+        self._check_config(batch_size, seq_len, is_prompt, False)
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         hidden_states = self.model.forward(input_ids=token_ids,
                                            positions=position_ids,
@@ -773,9 +903,7 @@ class HPUModelRunner:
                                 prefill_start_idx, sampled_token_ids, logprobs,
                                 logprob_token_ids):
         if len(list(prefill_data.zipped())) == 0:
-            logger.info(
-                f"[ENGINE_ITER {self._ENGINE_ITER}] No prefills detected.")
-            return None, None
+            return sampled_token_ids, logprobs, logprob_token_ids
 
         for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
                   logits_indices) in enumerate(prefill_data.zipped()):
@@ -820,9 +948,9 @@ class HPUModelRunner:
             req_idx = self.input_batch.req_id_to_index[req_id]
             self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
             req_state.output_token_ids.append(token_id)
-            detokenized = self._tokenizer.decode(
-                token_id) if token_id >= 0 and token_id <= len(
-                    self._tokenizer) else 'INVALID!!!'
+            #detokenized = self._tokenizer.decode(
+            #    token_id) if token_id >= 0 and token_id <= len(
+            #        self._tokenizer) else 'INVALID!!!'
             #logger.info(
             #    f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
             #)
@@ -830,9 +958,9 @@ class HPUModelRunner:
 
     def _execute_model_decode(self, scheduler_output, decode_data,
                               sampled_token_ids, logprobs, logprob_token_ids):
-        logger.info(
-            f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs..."
-        )
+        #logger.info(
+        #    f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs..."
+        #)
         logits = self._execute_model_generic(decode_data.token_ids,
                                              decode_data.position_ids,
                                              decode_data.attn_metadata,
@@ -869,9 +997,9 @@ class HPUModelRunner:
             token_id = sampled_token_ids_list[i]
             self.input_batch.token_ids_cpu[i, seq_len] = token_id
             req_state.output_token_ids.append(token_id)
-            detokenized = self._tokenizer.decode(
-                token_id) if token_id >= 0 and token_id <= len(
-                    self._tokenizer) else 'INVALID!!!'
+            #detokenized = self._tokenizer.decode(
+            #    token_id) if token_id >= 0 and token_id <= len(
+            #        self._tokenizer) else 'INVALID!!!'
             #logger.info(
             #    f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
             #)
@@ -883,9 +1011,9 @@ class HPUModelRunner:
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
         self._update_states(scheduler_output)
-        logger.info(
-            f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
-        )
+        #logger.info(
+        #    f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
+        #)
         prefill_data, decode_data = self._prepare_inputs(scheduler_output)
         num_reqs = self.input_batch.num_reqs
         sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
@@ -902,9 +1030,9 @@ class HPUModelRunner:
         ######################### PREFILLS #########################
         # Prefills run separately with shape [1, padded_prefill_len]
         if num_reqs - decode_data.num_decodes > 0:
-            logger.info(
-                f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs..."
-            )
+            #logger.info(
+            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs..."
+            #)
             sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_prefills(
                 scheduler_output, prefill_data, decode_data.num_decodes,
                 sampled_token_ids, logprobs, logprob_token_ids)
@@ -916,10 +1044,8 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
-        #import pdb
-        #pdb.set_trace()
-        logger.info(
-            f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
+        #logger.info(
+        #    f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
         if False:
             for i in range(num_reqs):
                 req_id = self.input_batch.req_ids[i]
