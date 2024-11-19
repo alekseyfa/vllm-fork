@@ -40,7 +40,7 @@ class KVCacheManager:
 
         # A Block pool of all kv-cache blocks.
         self.block_pool: List[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx) for idx in range(1, num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is

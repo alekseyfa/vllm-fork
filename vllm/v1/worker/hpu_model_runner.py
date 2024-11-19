@@ -518,12 +518,11 @@ class HPUModelRunner:
         block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
         block_usage = [[self.block_size] * (len(bt) - 1) + [lbu]
                        for bt, lbu in zip(block_tables, last_block_usage)
-                       if bt is not None]
+                       if bt]
 
         block_list = flatten(block_tables)
         block_groups = flatten(block_groups)
         block_usage = flatten(block_usage)
-
         assert len(block_list) == len(block_groups)
         assert len(block_list) == len(block_usage)
 
@@ -656,11 +655,12 @@ class HPUModelRunner:
         positions = positions[:padded_batch_size]
 
         # TOKEN_IDS. [batch, 1]
-        token_ids = torch.gather(
+        token_ids = torch.zeros((padded_batch_size, 1), dtype=torch.int32)
+        token_ids[:num_decodes] = torch.gather(
             input=torch.from_numpy(self.input_batch.token_ids_cpu),
             dim=1,
             index=index,
-        )[:padded_batch_size]
+        )[:num_decodes]
 
         # SLOT_MAPPING [batch, 1]
         # The "slot" is the "physical index" of a token in the KV cache.
@@ -678,13 +678,16 @@ class HPUModelRunner:
         slot_mapping = slot_mapping[:padded_batch_size]
 
         # BLOCK_TABLE [batch, max_num_blocks_per_req]
-        block_table = self.input_batch.block_table_cpu_tensor[:
-                                                              padded_batch_size]
-        # CONTEXT_LENS [batch_size]
-        context_lens = (positions.reshape(-1) + 1)
+        context_lens = self.input_batch.num_computed_tokens_cpu[:num_decodes]
+        num_blocks = np.ceil(context_lens / self.block_size).astype(np.int32).tolist()
+        block_tables_list = []
+        for i,n  in enumerate(num_blocks):
+            block_tables_list.append(self.input_batch.block_table_cpu_tensor[i,:n].tolist())
 
-        block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(
-            block_table, slot_mapping)
+        # CONTEXT_LENS [batch_size]
+        #context_lens = (positions.reshape(-1) + 1)
+
+        block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(block_tables_list, slot_mapping.tolist())
 
         num_scheduled_tokens = []
         max_num_scheduled_tokens = 0
@@ -703,15 +706,16 @@ class HPUModelRunner:
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
         logits_indices = query_start_loc[1:] - 1
         # CPU<>HPU sync happens here.
-        logger.info(f'decode token_ids: {token_ids}')
-        logger.info(f'decode positions: {positions}')
-        logger.info(f'decode logits_indices: {logits_indices}')
-        logger.info(f'decode block_list: {block_list}')
-        logger.info(f'decode block_usage: {block_usage}')
-        logger.info(f'decode block_groups: {block_groups}')
-        logger.info(
-            f'decode num_decode_tokens: {torch.sum(context_lens).item()}')
-        logger.info(f'decode slot_mapping: {slot_mapping}')
+        #logger.info(f'decode token_ids: {token_ids}')
+        #logger.info(f'decode positions: {positions}')
+        #logger.info(f'decode logits_indices: {logits_indices}')
+        #logger.info(f'decode block_table: {block_tables_list}')
+        #logger.info(f'decode block_list: {block_list}')
+        #logger.info(f'decode block_usage: {block_usage}')
+        #logger.info(f'decode block_groups: {block_groups}')
+        #logger.info(
+        #    f'decode num_decode_tokens: {torch.sum(context_lens).item()}')
+        #logger.info(f'decode slot_mapping: {slot_mapping}')
         return DecodeInputData(
             num_decodes=num_decodes,
             token_ids=token_ids.to(self.device),
@@ -721,7 +725,7 @@ class HPUModelRunner:
                 block_list=block_list.to(self.device),
                 block_usage=block_usage.to(self.device),
                 block_groups=block_groups.to(self.device),
-                num_decode_tokens=torch.sum(context_lens).item(),
+                num_decode_tokens=torch.tensor(np.sum(context_lens)).to(self.device),
                 slot_mapping=slot_mapping.to(self.device),
             ))
 
@@ -787,7 +791,11 @@ class HPUModelRunner:
             )
 
             # NOTE: HPU<>CPU sync happens here.
-            token_id = sampler_output.sampled_token_ids.cpu().item()
+            
+            #token_id = sampler_output.sampled_token_ids.cpu().item()
+            assert self.input_batch.all_greedy, "Only greedy sampling is supported in HPU v1 engine"
+            sampled_token_ids_argmax = torch.argmax(logits) 
+            token_id = sampled_token_ids_argmax.cpu().item()
             sampled_token_ids[prefill_start_idx + idx] = token_id
             req_state = self.requests[req_id]
 
@@ -815,9 +823,9 @@ class HPUModelRunner:
             detokenized = self._tokenizer.decode(
                 token_id) if token_id >= 0 and token_id <= len(
                     self._tokenizer) else 'INVALID!!!'
-            logger.info(
-                f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
-            )
+            #logger.info(
+            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
+            #)
         return sampled_token_ids, logprobs, logprob_token_ids
 
     def _execute_model_decode(self, scheduler_output, decode_data,
@@ -837,11 +845,13 @@ class HPUModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-
+        assert self.input_batch.all_greedy, "Only greedy sampling is supported in HPU v1 engine"
+        sampled_token_ids_argmax = torch.argmax(logits, dim=1) 
         # NOTE: TPU<>CPU sync happens here.
         # We need to call .cpu() first to avoid recompilation.
-        token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.
-                                                           num_decodes]
+        #token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.
+        #                                                   num_decodes]
+        token_ids = sampled_token_ids_argmax.cpu()[:decode_data.num_decodes]
         sampled_token_ids_list = token_ids.tolist()
         sampled_token_ids[:decode_data.num_decodes] = token_ids
 
@@ -862,9 +872,9 @@ class HPUModelRunner:
             detokenized = self._tokenizer.decode(
                 token_id) if token_id >= 0 and token_id <= len(
                     self._tokenizer) else 'INVALID!!!'
-            logger.info(
-                f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
-            )
+            #logger.info(
+            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
+            #)
         return sampled_token_ids, None, None
 
     @torch.inference_mode()
@@ -906,8 +916,8 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
-        import pdb
-        pdb.set_trace()
+        #import pdb
+        #pdb.set_trace()
         logger.info(
             f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
         if False:
