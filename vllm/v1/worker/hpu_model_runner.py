@@ -193,24 +193,6 @@ def gather_list(input, indices, v):
     return [input[i] if i is not None else v for i in indices]
 
 
-def _get_padded_batch_size(batch_size: int) -> int:
-    # The GMM Pallas kernel requires num_tokens * topk to be a multiple of 16.
-    # To meet this requirement in the simplest way, we set the minimal batch
-    # size to 8.
-    if batch_size <= 8:
-        return 8
-    else:
-        return ((batch_size + 15) // 16) * 16
-
-
-def _get_padded_prefill_len(x: int) -> int:
-    # NOTE(woosuk): The pallas FlashAttention kernel requires the sequence
-    # length to be a multiple of 16. We pad the prompt length to the nearest
-    # multiple of 16. This is also good for performance.
-    if x <= 16:
-        return 16
-    return 1 << (x - 1).bit_length()
-
 
 class HpuModelAdapter:
 
@@ -772,7 +754,10 @@ class HPUModelRunner:
             if bucketing:
                 padded_prompt_len = find_bucket(prompt_len, self.bucketing_global_state.prompt_seq_bucket_cfg)
             else:
-                padded_prompt_len = _get_padded_prefill_len(prompt_len)
+                #NOTE(kzawora): On HPU prompt length needs to be block_size 
+                # aligned, so we're padding to that, even if bucketing 
+                # is disabled.
+                padded_prompt_len = math.ceil(prompt_len / self.block_size) * self.block_size
             prefill_prompt_lens.append(prompt_len)
             assert padded_prompt_len <= self.max_model_len
 
@@ -833,7 +818,7 @@ class HPUModelRunner:
         if bucketing:
             padded_batch_size = find_bucket(num_decodes, self.bucketing_global_state.decode_bs_bucket_cfg)
         else:
-            padded_batch_size = _get_padded_batch_size(num_decodes)
+            padded_batch_size = num_decodes
 
         # POSITIONS. [batch, 1]
         # We slice at the end, since we use the positions for gathering.
@@ -858,7 +843,9 @@ class HPUModelRunner:
             input=self.input_batch.block_table_cpu_tensor,
             dim=1,
             index=(index // self.block_size))
-        block_offsets = index % self.block_size
+        # NOTE(kzawora): the "-1" is what causes this entire thing to work 
+        # properly and have good accuracy - why? beats me...
+        block_offsets = (index - 1) % self.block_size
         slot_mapping = block_number * self.block_size + block_offsets
         # Set an out of range value for the padding tokens so that they
         # are ignored when inserting into the KV cache.
@@ -875,7 +862,7 @@ class HPUModelRunner:
         # CONTEXT_LENS [batch_size]
         #context_lens = (positions.reshape(-1) + 1)
 
-        block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(block_tables_list, slot_mapping.tolist())
+        block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(block_tables_list, slot_mapping.tolist(), bucketing)
 
         num_scheduled_tokens = []
         max_num_scheduled_tokens = 0
@@ -1081,7 +1068,7 @@ class HPUModelRunner:
         #logger.info(
         #    f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
         #)
-        prefill_data, decode_data = self._prepare_inputs(scheduler_output, bucketing=self.bucketing)
+        prefill_data, decode_data = self._prepare_inputs(scheduler_output, bucketing=self.enable_bucketing)
         num_reqs = self.input_batch.num_reqs
         sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
@@ -1271,12 +1258,6 @@ class HPUModelRunner:
             self.kv_caches.append(kv_layer)
         htorch.hpu.synchronize()
 
-    def _get_padded_batch_size(self, batch_size: int) -> Optional[int]:
-        # TODO: Optimize this?
-        for size in self.cudagraph_batch_sizes:
-            if batch_size <= size:
-                return size
-        return None
 
 
 @dataclass
@@ -1555,21 +1536,6 @@ class InputBatch:
     @property
     def all_random(self) -> bool:
         return len(self.greedy_reqs) == 0
-
-        #    @property
-        #    def all_prefill(self) -> bool:
-        return all(
-            output_tokens == 0
-            for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
-
-
-#    @property
-#    def all_decode(self) -> bool:
-#        return all(output_tokens > 0 for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
-
-    @property
-    def mixed_batch(self) -> bool:
-        return not self.all_prefill and not self.all_decode
 
     @property
     def no_top_p(self) -> bool:

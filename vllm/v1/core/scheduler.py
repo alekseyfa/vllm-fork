@@ -228,7 +228,6 @@ class Scheduler:
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     break
-                request.num_computed_tokens = num_computed_tokens
 
                 self.waiting.popleft()
                 self.running.append(request)
@@ -525,7 +524,6 @@ class NewRequestData:
     sampling_params: SamplingParams
     block_ids: List[int]
     num_computed_tokens: int
-    num_output_tokens: int = 0
 
     @classmethod
     def from_request(
@@ -541,8 +539,7 @@ class NewRequestData:
                    mm_positions=request.mm_positions,
                    sampling_params=request.sampling_params,
                    block_ids=block_ids,
-                   num_computed_tokens=num_computed_tokens,
-                   num_output_tokens=request.num_output_tokens)
+                   num_computed_tokens=num_computed_tokens)
 
 
 @dataclass
@@ -551,7 +548,6 @@ class ResumedRequestData:
     req_id: str
     block_ids: List[int]
     num_computed_tokens: int
-    num_output_tokens: int
 
     @classmethod
     def from_request(
@@ -562,8 +558,7 @@ class ResumedRequestData:
     ) -> "ResumedRequestData":
         return cls(req_id=request.request_id,
                    block_ids=block_ids,
-                   num_computed_tokens=num_computed_tokens,
-                   num_output_tokens=request.num_output_tokens)
+                   num_computed_tokens=num_computed_tokens)
 
 
 @dataclass
@@ -572,7 +567,6 @@ class RunningRequestData:
     req_id: str
     new_block_ids: List[int]
     num_computed_tokens: int
-    num_output_tokens: int
 
     @classmethod
     def from_request(
@@ -583,8 +577,7 @@ class RunningRequestData:
     ) -> "RunningRequestData":
         return cls(req_id=request.request_id,
                    new_block_ids=new_block_ids,
-                   num_computed_tokens=num_computed_tokens,
-                   num_output_tokens=request.num_output_tokens)
+                   num_computed_tokens=num_computed_tokens)
 
 
 @dataclass
