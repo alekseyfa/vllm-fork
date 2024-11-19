@@ -74,7 +74,10 @@ class RayHPUExecutor(DistributedGPUExecutor):
         for worker in self.workers:
             worker.__ray_terminate__.remote()
         if hasattr(self, "forward_dag") and self.forward_dag is not None:
-            self.forward_dag.teardown()            
+            self.forward_dag.teardown()
+            import ray
+            for worker in self.workers:
+                ray.kill(worker)
             self.forward_dag = None
 
     def finish_measurements(self):
