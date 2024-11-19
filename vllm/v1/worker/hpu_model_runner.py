@@ -524,7 +524,60 @@ class HPUModelRunner:
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'true').lower() == 'true'
         self.seen_configs: set = set()
-        
+        self.enable_bucketing = os.environ.get('VLLM_DISABLE_BUCKETING',
+                                                'false').lower() not in ['true', '1']
+        if self.enable_bucketing:
+            logger.info("Bucketing is ON.")        
+            self.bucketing_global_state = HPUBucketingGlobalState()
+            self.max_num_seqs = self.scheduler_config.max_num_seqs
+            self._setup_buckets()
+        else:
+            logger.info("Bucketing is OFF.")        
+    def _setup_buckets(self) -> None:
+        align_bs = lambda x: min(self.max_num_seqs, x)
+        #FIXME: The default values should be max_model_len
+        max_prompt_seq = 1024
+        max_decode_seq = 2048
+        self.bucketing_global_state.prompt_bs_bucket_cfg = read_bucket_settings(
+            'prompt',
+            'bs',
+            min=1,
+            step=align_bs(32),
+            max=64)
+        self.bucketing_global_state.decode_bs_bucket_cfg = read_bucket_settings(
+            'decode', 'bs', min=1, step=align_bs(32), max=self.max_num_seqs)
+        self.bucketing_global_state.prompt_seq_bucket_cfg = \
+            read_bucket_settings(
+            'prompt',
+            'seq',
+            min=self.block_size,
+            step=self.block_size,
+            max=max_prompt_seq)
+        self.bucketing_global_state.decode_block_bucket_cfg = \
+            read_bucket_settings(
+            'decode',
+            'block',
+            min=self.block_size,
+            step=self.block_size,
+            max=max(self.block_size,
+                    self.max_num_seqs * max_decode_seq // self.block_size))
+        self.graphed_buckets: Set[Any] = set()
+
+        msg = ("Prompt bucket config (min, step, max_warmup) "
+               f"bs:{self.bucketing_global_state.prompt_bs_bucket_cfg}, "
+               f"seq:{self.bucketing_global_state.prompt_seq_bucket_cfg}")
+        logger.info(msg)
+
+        msg = ("Decode bucket config (min, step, max_warmup) "
+               f"bs:{self.bucketing_global_state.decode_bs_bucket_cfg}, "
+               f"block:{self.bucketing_global_state.decode_block_bucket_cfg}")
+        logger.info(msg)
+
+    def find_bucket(value: int, config: Tuple[int, int, int]):
+        bmin, bstep, _ = config
+        next_step = round_up(value, bstep)
+        next_pow = next_pow2(value, bmin)
+        return max(bmin, min(next_step, next_pow))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -631,7 +684,7 @@ class HPUModelRunner:
             seq_idx=seq_idx)
         return sampling_metadata
 
-    def get_habana_paged_attn_buffers(self, block_tables, slot_mapping):
+    def get_habana_paged_attn_buffers(self, block_tables, slot_mapping, bucketing=True):
 
         last_block_usage = [
             slot[0] % self.block_size + 1 for slot in slot_mapping
@@ -650,9 +703,10 @@ class HPUModelRunner:
         padding_fn = None
         if self.use_contiguous_pa:
             block_bucket_size = max(max(block_list) + 1, len(block_list))
-            #block_bucket_size = find_bucket(
-            #    block_bucket_size,
-            #    self.bucketing_global_state.decode_block_bucket_cfg)
+            if bucketing:
+                block_bucket_size = find_bucket(
+                    block_bucket_size,
+                    self.bucketing_global_state.decode_block_bucket_cfg)
             indices: List[Any]
             indices = [None] * block_bucket_size
             for i, bid in enumerate(block_list):
@@ -660,10 +714,13 @@ class HPUModelRunner:
             padding_fn = lambda tensor, pad_value: gather_list(
                 tensor, indices, pad_value)
         else:
-            block_bucket_size = len(block_list)
-            #block_bucket_size = find_bucket(
-            #    len(block_list),
-            #    self.bucketing_global_state.decode_block_bucket_cfg)
+            block_bucket_size: int
+            if bucketing:
+                block_bucket_size = find_bucket(
+                    len(block_list),
+                    self.bucketing_global_state.decode_block_bucket_cfg)
+            else:
+                block_bucket_size = len(block_list)
             padding_fn = lambda tensor, pad_value: pad_list(
                 tensor, block_bucket_size, pad_value)
 
@@ -690,6 +747,7 @@ class HPUModelRunner:
     def _prepare_prefill_inputs(
         self,
         num_scheduled_tokens: List[int],
+        bucketing=True
     ) -> PrefillInputData:
         # Each prefill run separately with shape [1, padded_prompt_len].
         # So we create lists that will be used in execute_model().
@@ -710,7 +768,11 @@ class HPUModelRunner:
 
             # STATIC SHAPE: prefills are padded to the next power of 2.
             prompt_len = num_scheduled_tokens[idx]
-            padded_prompt_len = _get_padded_prefill_len(prompt_len)
+            padded_prompt_len : int
+            if bucketing:
+                padded_prompt_len = find_bucket(prompt_len, self.bucketing_global_state.prompt_seq_bucket_cfg)
+            else:
+                padded_prompt_len = _get_padded_prefill_len(prompt_len)
             prefill_prompt_lens.append(prompt_len)
             assert padded_prompt_len <= self.max_model_len
 
@@ -754,7 +816,8 @@ class HPUModelRunner:
                                 logits_indices=prefill_logits_indices)
 
     def _prepare_decode_inputs(self, num_decodes: int,
-                               scheduler_output) -> DecodeInputData:
+                               scheduler_output,
+                               bucketing=True) -> DecodeInputData:
         # Decodes run as one single padded batch with shape [batch, 1]
         #
         # We need to set _PAD_SLOT_ID for the padding tokens in the
@@ -766,7 +829,11 @@ class HPUModelRunner:
             return DecodeInputData(num_decodes=0)
 
         # PAD FOR STATIC SHAPES.
-        padded_batch_size = _get_padded_batch_size(num_decodes)
+        padded_batch_size : int
+        if bucketing:
+            padded_batch_size = find_bucket(num_decodes, self.bucketing_global_state.decode_bs_bucket_cfg)
+        else:
+            padded_batch_size = _get_padded_batch_size(num_decodes)
 
         # POSITIONS. [batch, 1]
         # We slice at the end, since we use the positions for gathering.
@@ -841,7 +908,7 @@ class HPUModelRunner:
             ))
 
     def _prepare_inputs(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", bucketing=True
     ) -> Tuple[PrefillInputData, Optional[DecodeInputData]]:
 
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -862,8 +929,8 @@ class HPUModelRunner:
                 assert num_tokens == 1
 
         return (
-            self._prepare_prefill_inputs(num_scheduled_tokens),
-            self._prepare_decode_inputs(num_decodes, scheduler_output),
+            self._prepare_prefill_inputs(num_scheduled_tokens, bucketing),
+            self._prepare_decode_inputs(num_decodes, scheduler_output, bucketing),
         )
     
     def _seq_len(self, attn_metadata):
@@ -1014,7 +1081,7 @@ class HPUModelRunner:
         #logger.info(
         #    f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
         #)
-        prefill_data, decode_data = self._prepare_inputs(scheduler_output)
+        prefill_data, decode_data = self._prepare_inputs(scheduler_output, bucketing=self.bucketing)
         num_reqs = self.input_batch.num_reqs
         sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
