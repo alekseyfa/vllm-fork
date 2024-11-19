@@ -192,6 +192,11 @@ def flatten(in_list):
 def gather_list(input, indices, v):
     return [input[i] if i is not None else v for i in indices]
 
+def _async_h2d_tensor_copy(source, device='hpu'):
+    assert source.device.type == 'cpu', "Source tensor is not present in host memory!" 
+    target = torch.empty(source.shape, dtype=source.dtype, device=device)
+    target.copy_(source, non_blocking=True)
+    return target
 
 
 class HpuModelAdapter:
@@ -710,20 +715,14 @@ class HPUModelRunner:
         block_groups = padding_fn(block_groups, -1)
         block_usage = padding_fn(block_usage, 1)
 
-        block_list = torch.tensor(block_list, dtype=torch.int, device='cpu')
+        block_list = torch.tensor(block_list, dtype=torch.long, device='cpu')
         block_groups = torch.tensor(block_groups,
-                                    dtype=torch.int,
+                                    dtype=torch.long,
                                     device='cpu')
         block_usage = torch.tensor(block_usage,
                                    dtype=self.model_config.dtype,
                                    device='cpu')
 
-        block_list = block_list.to(  # type: ignore
-            self.device, non_blocking=True)
-        block_groups = block_groups.to(  # type: ignore
-            self.device, non_blocking=True)
-        block_usage = block_usage.to(  # type: ignore
-            self.device, non_blocking=True)
         return block_list, block_groups, block_usage
 
     def _prepare_prefill_inputs(
@@ -764,11 +763,9 @@ class HPUModelRunner:
             # TOKEN_IDS.
             token_ids = torch.from_numpy(self.input_batch.token_ids_cpu[
                 idx, :padded_prompt_len].reshape(1, -1))
-            prefill_token_ids.append(token_ids.to(self.device))
 
             # POSITIONS.
             positions = self.prefill_positions[:, :padded_prompt_len]
-            prefill_position_ids.append(positions.to(self.device))
             # SLOT_MAPPING.
             # The "slot" is the "physical index" of a token in the KV cache.
             # Look up the block_idx in the block table (logical<>physical map)
@@ -782,16 +779,26 @@ class HPUModelRunner:
             slot_mapping[:, prompt_len:] = _PAD_SLOT_ID
             slot_mapping = slot_mapping.long()
 
+            # HPU should *not* sync here with CPU
+            seq_lens_tensor = torch.tensor(prompt_len, device='cpu')
+            
+            token_ids_device = _async_h2d_tensor_copy(token_ids, self.device)
+            positions_device = _async_h2d_tensor_copy(positions, self.device)
+            seq_lens_tensor_device = _async_h2d_tensor_copy(seq_lens_tensor, self.device)
+            slot_mapping_device = _async_h2d_tensor_copy(slot_mapping, self.device)
+
+            prefill_token_ids.append(token_ids_device)
+            prefill_position_ids.append(positions_device)
             # ATTN_METADATA.
             prefill_attn_metadata.append(
                 HPUAttentionMetadata.make_prefill_metadata(
-                    seq_lens_tensor=torch.tensor(prompt_len,
-                                                 device=self.device),
+                    seq_lens_tensor=seq_lens_tensor_device,
                     num_prefills=1,
                     num_prefill_tokens=prompt_len,
-                    slot_mapping=slot_mapping.to(self.device),
+                    slot_mapping=slot_mapping_device,
                 ))
             prefill_logits_indices.append(prompt_len - 1)
+
 
         return PrefillInputData(request_ids=prefill_request_ids,
                                 prompt_lens=prefill_prompt_lens,
@@ -880,18 +887,29 @@ class HPUModelRunner:
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
         logits_indices = query_start_loc[1:] - 1
-        # CPU<>HPU sync happens here.
+        num_decode_tokens = torch.tensor(np.sum(context_lens), device='cpu')
+
+        # CPU<>HPU sync *should not* happen here.
+        token_ids_device = _async_h2d_tensor_copy(token_ids, self.device)
+        positions_device = _async_h2d_tensor_copy(positions, self.device)
+        logits_indices_device = _async_h2d_tensor_copy(logits_indices, self.device)
+        block_list_device = _async_h2d_tensor_copy(block_list, self.device)
+        block_usage_device = _async_h2d_tensor_copy(block_usage, self.device)
+        block_groups_device = _async_h2d_tensor_copy(block_groups, self.device)
+        num_decode_tokens_device = _async_h2d_tensor_copy(num_decode_tokens, self.device)
+        slot_mapping_device = _async_h2d_tensor_copy(slot_mapping, self.device)
+        
         return DecodeInputData(
             num_decodes=num_decodes,
-            token_ids=token_ids.to(self.device),
-            position_ids=positions.to(self.device),
-            logits_indices=logits_indices.to(self.device),
+            token_ids=token_ids_device,
+            position_ids=positions_device,
+            logits_indices=logits_indices_device,
             attn_metadata=HPUAttentionMetadata.make_decode_metadata(
-                block_list=block_list.to(self.device),
-                block_usage=block_usage.to(self.device),
-                block_groups=block_groups.to(self.device),
-                num_decode_tokens=torch.tensor(np.sum(context_lens)).to(self.device),
-                slot_mapping=slot_mapping.to(self.device),
+                block_list=block_list_device,
+                block_usage=block_usage_device,
+                block_groups=block_groups_device,
+                num_decode_tokens=num_decode_tokens_device,
+                slot_mapping=slot_mapping_device,
             ))
 
     def _prepare_inputs(
