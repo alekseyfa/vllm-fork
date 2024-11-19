@@ -971,111 +971,6 @@ class HPUModelRunner:
         logits = self.model.compute_logits(hidden_states, None)
         return logits
 
-    def _execute_model_prefills(self, scheduler_output, prefill_data,
-                                prefill_start_idx, sampled_token_ids, logprobs,
-                                logprob_token_ids):
-        if len(list(prefill_data.zipped())) == 0:
-            return sampled_token_ids, logprobs, logprob_token_ids
-
-        for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
-                  logits_indices) in enumerate(prefill_data.zipped()):
-            logits = self._execute_model_generic(token_ids, position_ids,
-                                                 attn_metadata, logits_indices)
-
-            # Sample the next token and get logprobs if needed.
-            sampling_metadata = self._prepare_sampling(scheduler_output,
-                                                       seq_idx=idx)
-            sampler_output = self.model.sample(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
-
-            # NOTE: HPU<>CPU sync happens here.
-            
-            #token_id = sampler_output.sampled_token_ids.cpu().item()
-            assert self.input_batch.all_greedy, "Only greedy sampling is supported in HPU v1 engine"
-            sampled_token_ids_argmax = torch.argmax(logits) 
-            token_id = sampled_token_ids_argmax.cpu().item()
-            sampled_token_ids[prefill_start_idx + idx] = token_id
-            req_state = self.requests[req_id]
-
-            if sampler_output.logprob_token_ids is not None:
-                logprob_token_ids[
-                    prefill_start_idx +
-                    idx] = sampler_output.logprob_token_ids.cpu()
-            if sampler_output.logprobs is not None:
-                logprobs[prefill_start_idx +
-                         idx] = sampler_output.logprobs.cpu()
-
-            # TODO: ASSERT NO PREFIX CACHING.
-            assert req_state.num_computed_tokens == 0
-            seq_len = (req_state.num_computed_tokens +
-                       scheduler_output.num_scheduled_tokens[req_id])
-
-            # TODO: ASSERT NO CHUNKED PREFILL.
-            assert seq_len == req_state.num_tokens
-            assert prompt_len == seq_len
-
-            # UPDATE REQUEST STATE.
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
-            req_state.output_token_ids.append(token_id)
-            #detokenized = self._tokenizer.decode(
-            #    token_id) if token_id >= 0 and token_id <= len(
-            #        self._tokenizer) else 'INVALID!!!'
-            #logger.info(
-            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
-            #)
-        return sampled_token_ids, logprobs, logprob_token_ids
-
-    def _execute_model_decode(self, scheduler_output, decode_data,
-                              sampled_token_ids, logprobs, logprob_token_ids):
-        #logger.info(
-        #    f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs..."
-        #)
-        logits = self._execute_model_generic(decode_data.token_ids,
-                                             decode_data.position_ids,
-                                             decode_data.attn_metadata,
-                                             decode_data.logits_indices)
-
-        # Sample the next token and get logprobs if needed.
-        sampling_metadata = self._prepare_sampling(scheduler_output,
-                                                   decode_only=True)
-        sampler_output = self.model.sample(
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-        )
-        assert self.input_batch.all_greedy, "Only greedy sampling is supported in HPU v1 engine"
-        sampled_token_ids_argmax = torch.argmax(logits, dim=1) 
-        # NOTE: TPU<>CPU sync happens here.
-        # We need to call .cpu() first to avoid recompilation.
-        #token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.
-        #                                                   num_decodes]
-        token_ids = sampled_token_ids_argmax.cpu()[:decode_data.num_decodes]
-        sampled_token_ids_list = token_ids.tolist()
-        sampled_token_ids[:decode_data.num_decodes] = token_ids
-
-        # UPDATE REQUEST STATE.
-        for i, req_id in enumerate(
-                self.input_batch.req_ids[:decode_data.num_decodes]):
-            req_state = self.requests[req_id]
-
-            # TODO: ASSERT NO CHUNKED PREFILL.
-            assert scheduler_output.num_scheduled_tokens[req_id] == 1
-            seq_len = (req_state.num_computed_tokens +
-                       scheduler_output.num_scheduled_tokens[req_id])
-            assert seq_len == req_state.num_tokens
-
-            token_id = sampled_token_ids_list[i]
-            self.input_batch.token_ids_cpu[i, seq_len] = token_id
-            req_state.output_token_ids.append(token_id)
-            #detokenized = self._tokenizer.decode(
-            #    token_id) if token_id >= 0 and token_id <= len(
-            #        self._tokenizer) else 'INVALID!!!'
-            #logger.info(
-            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
-            #)
-        return sampled_token_ids, None, None
 
     @torch.inference_mode()
     def execute_model(
@@ -1083,41 +978,87 @@ class HPUModelRunner:
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
         self._update_states(scheduler_output)
-        #logger.info(
-        #    f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
-        #)
         prefill_data, decode_data = self._prepare_inputs(scheduler_output, bucketing=self.enable_bucketing)
         num_reqs = self.input_batch.num_reqs
-        sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
+        sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
         logprob_token_ids = None
         logprobs = None
+        split_sampler = False
+        prefill_output = None
+        decode_output = None
         ######################### DECODES #########################
         # Decodes run as one single batch with [padded_batch, 1]
         if decode_data.num_decodes > 0:
-            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_decode(
-                scheduler_output, decode_data, sampled_token_ids, logprobs,
-                logprob_token_ids)
-
+            htorch.core.mark_step()
+            logits = self._execute_model_generic(decode_data.token_ids,
+                                                decode_data.position_ids,
+                                                decode_data.attn_metadata,
+                                                decode_data.logits_indices)
+            if split_sampler:
+                #TODO(kzawora): perform sampling properly
+                decode_output = torch.argmax(logits, dim=1)
+            else:
+                decode_output = logits
+            htorch.core.mark_step()
         ######################### PREFILLS #########################
         # Prefills run separately with shape [1, padded_prefill_len]
         if num_reqs - decode_data.num_decodes > 0:
-            #logger.info(
-            #    f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs..."
-            #)
-            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_prefills(
-                scheduler_output, prefill_data, decode_data.num_decodes,
-                sampled_token_ids, logprobs, logprob_token_ids)
+            htorch.core.mark_step()
+            prefill_output_list = []
+            for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
+                    logits_indices) in enumerate(prefill_data.zipped()):
+                logits = self._execute_model_generic(token_ids, position_ids,
+                                                    attn_metadata, logits_indices)
+                if split_sampler:
+                    prefill_token = torch.argmax(logits)
+                    prefill_output_list.append(prefill_token)
+                else:
+                    prefill_output_list.append(logits)
+            prefill_output = torch.stack(prefill_output_list, dim=0)
+            htorch.core.mark_step()
+ 
+        ######################### SAMPLING #########################
+        #NOTE(kzawora): It might be better to do separate sampling
+        # for prefills and decodes, since they will have more predictable 
+        # shapes. Or it might not. Idk. I implemented both.
+        # In my testing, split_sampler=False was a bit faster (Llama3.1-8B@GSM8K), 
+        # no differences in accuracy observed. YMMV.
+        model_output = None
+        if decode_output is not None and prefill_output is not None:
+            model_output = torch.cat((decode_output, prefill_output), dim=0)
+        else:
+            model_output = decode_output if decode_output is not None else prefill_output
+        
+        if split_sampler:
+            sampled_token_ids = model_output
+        else:
+            sampled_token_ids = torch.argmax(model_output, dim=1)
 
+        # HPU <-> CPU sync happens here
+        sampled_token_ids_cpu = sampled_token_ids.cpu()
+        sampled_token_ids_list = sampled_token_ids_cpu.tolist()
+        htorch.core.mark_step()
+
+        ################## UPDATE REQUEST STATE ##################
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            req_state = self.requests[req_id]
+
+            seq_len = (req_state.num_computed_tokens +
+                        scheduler_output.num_scheduled_tokens[req_id])
+            token_id = sampled_token_ids_list[i]
+            self.input_batch.token_ids_cpu[i, seq_len] = token_id
+            req_state.output_token_ids.append(token_id)
+
+        ################## RETURN ##################
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids[:num_reqs],
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids_cpu=sampled_token_ids,
+            sampled_token_ids_cpu=sampled_token_ids_cpu,
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
-        #logger.info(
-        #    f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
+
         if False:
             for i in range(num_reqs):
                 req_id = self.input_batch.req_ids[i]
@@ -1131,7 +1072,7 @@ class HPUModelRunner:
                         self.input_batch.num_prompt_tokens_cpu[req_idx], self.
                         input_batch.num_computed_tokens_cpu[req_idx])])
                 logger.info(
-                    f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} generated token: {self._tokenizer.decode(sampled_token_ids[req_idx])!r}, all generated so far: {generated!r}'
+                    f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} generated token: {self._tokenizer.decode(sampled_token_ids_cpu[req_idx])!r}, all generated so far: {generated!r}'
                 )
         self._ENGINE_ITER += 1
         return model_runner_output
