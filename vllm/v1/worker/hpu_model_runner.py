@@ -793,8 +793,7 @@ class HPUModelRunner:
                 slot_mapping[i, prompt_len:] = _PAD_SLOT_ID
             slot_mapping = slot_mapping.long()
             
-            # FIXME(kzawora): use padded batch size here
-            logits_indices = torch.zeros(num_prefills, dtype=torch.int32, device='cpu')
+            logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
             query_start_loc = torch.empty((num_prefills + 1, ),
                                         dtype=torch.int32,
                                         device="cpu")
@@ -901,6 +900,7 @@ class HPUModelRunner:
 
         block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(block_tables_list, slot_mapping.tolist(), bucketing)
 
+        logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
         query_start_loc = torch.empty((num_decodes + 1, ),
                                       dtype=torch.int32,
                                       device="cpu",
@@ -908,7 +908,7 @@ class HPUModelRunner:
         query_start_loc_np = query_start_loc.numpy()
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens[:num_decodes], out=query_start_loc_np[1:])
-        logits_indices = query_start_loc[1:] - 1
+        logits_indices[:num_decodes] = query_start_loc[1:] - 1
         num_decode_tokens = torch.tensor(np.sum(context_lens), device='cpu')
 
         # CPU<>HPU sync *should not* happen here.
@@ -998,70 +998,162 @@ class HPUModelRunner:
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
+        # NOTE(kzawora): Since scheduler doesn't differentiate between prefills 
+        # and decodes, we must handle mixed batches. In _update_states we make 
+        # sure that first self.input_batch.num_decodes requests are decodes, 
+        # and remaining ones until the end are prefills. 
+        
+        # If num_decodes == self.input_batch.num_reqs, then batch is all decode, and only a single decode forward pass will be executed in this method.
+        # If num_decodes == 0, then batch is all prefill, and only prefill forward passes will be executed  in this method.
+        # If neither apply, then batch is mixed, and both prefill and decode forward passes will be executed in this method.
+        
+        # First, we will execute all decodes (if any) in a single batch, 
+        # then we'll execute prefills in batches of up to max_prefill_batch_size elements. 
+        # All shapes used in forward passes are bucketed appropriately to mitigate risk of graph recompilations.
+
+        # We can do sampling directly after executing each forward pass (split_sampler=True),
+        # or execute all forward passes, join the results and execute it once (split_sampler=False).
+        # Everything is done asynchronously - the only sync point is the place 
+        # where we copy the generated tokens back to the host. 
+
+        # Example: If a batch has 6 requests, 3 prefills and 3 decodes, the unprocessed sequences in batch will be laid as follows:
+        # [D0, D1, D2, P0, P1, P2] 
+        # If we assume max_prefill_batch_size=2, and split_sampler=True the flow of this method will look as follows:
+        # prepare_inputs: bucket [D0, D1, D2] -> [D0, D1, D2, 0] (BS=4 bucket, 1 seq padding)
+        # prepare_inputs: bucket [P0, P1, P2] -> [P0, P1], [P2] (BS=2 + BS=1 bucket, no seqs padding)
+        # decode forward pass BS4 [D0, D1, D2, 0]
+        # decode compute_logits BS4 [D0, D1, D2, 0]
+        # decode sampler BS4 [D0, D1, D2, 0] -> [tokD0, tokD1, tokD2, 0]
+        # prefill[iter 0] forward pass BS2 [P0, P1]
+        # prefill[iter 0] compute_logits BS2 [P0, P1]
+        # prefill[iter 0] sampler BS2 [P0, P1] -> [tokP0, tokP1]
+        # prefill[iter 1] forward pass BS1 [P0, P1]
+        # prefill[iter 1] compute_logits BS1 [P0, P1]
+        # prefill[iter 1] sampler BS1 [P0, P1] -> [tokP2]
+        # prefill concat sampler results [tokP0, tokP1], [tokP2] -> [tokP0, tokP1, tokP2]
+        # Join the prefill and decode on device into [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2]
+        # Transfer [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2] to CPU
+        # On CPU, sanitize [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2] -> [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+        # Return [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+        
+        # Example2: Same thing, but with max_prefill_batch_size=4:
+        # prepare_inputs: bucket [D0, D1, D2] -> [D0, D1, D2, 0] (BS=4 bucket, 1 seq padding)
+        # prepare_inputs: bucket [P0, P1, P2] -> [P0, P1, P2, 0] (BS=4 bucket, 1 seq padding)
+        # decode forward pass BS4 [D0, D1, D2, 0]
+        # decode compute_logits BS4 [D0, D1, D2, 0]
+        # decode sampler BS4 [D0, D1, D2, 0] -> [tokD0, tokD1, tokD2, 0]
+        # prefill[iter 0] forward pass BS4 [P0, P1, P2, 0]
+        # prefill[iter 0] compute_logits BS4 [P0, P1, P2, 0]
+        # prefill[iter 0] sampler BS4 [P0, P1, P2, 0] -> [tokP0, tokP1, tokP2, 0]
+        # Join the prefill and decode on device into [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0]
+        # Transfer [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0] to CPU
+        # On CPU, sanitize [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0] -> [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+        # Return [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+
+        # Example2: Same thing, but max_prefill_batch_size=4 and split_sampler=False:
+        # prepare_inputs: bucket [D0, D1, D2] -> [D0, D1, D2, 0] (BS=4 bucket, 1 seq padding)
+        # prepare_inputs: bucket [P0, P1, P2] -> [P0, P1, P2, 0] (BS=4 bucket, 1 seq padding)
+        # decode forward pass BS4 [D0, D1, D2, 0]
+        # decode compute_logits BS4 [D0, D1, D2, 0]
+        # prefill[iter 0] forward pass BS4 [P0, P1, P2, 0]
+        # prefill[iter 0] compute_logits BS4 [P0, P1, P2, 0]
+        # Join the prefill and decode on device into [D0, D1, D2, 0, P0, P1, P2, 0]
+        # joint sampler BS8 [D0, D1, D2, 0, P0, P1, P2, 0] -> [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0]
+        # Transfer [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0] to CPU
+        # On CPU, sanitize [tokD0, tokD1, tokD2, 0, tokP0, tokP1, tokP2, 0] -> [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+        # Return [tokD0, tokD1, tokD2, tokP0, tokP1, tokP2]
+
         self._update_states(scheduler_output)
         prefill_data, decode_data = self._prepare_inputs(scheduler_output, bucketing=self.enable_bucketing)
         num_reqs = self.input_batch.num_reqs
-        sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
+        num_decodes = decode_data.num_decodes
+        num_prefills = num_reqs - num_decodes
+        num_padded_decodes = decode_data.token_ids.shape[0] if num_decodes > 0 else 0
+
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
         logprob_token_ids = None
         logprobs = None
         split_sampler = False
-        prefill_output = None
-        decode_output = None
+        prefill_output_device = None
+        decode_output_device = None
+
         ######################### DECODES #########################
-        # Decodes run as one single batch with [padded_batch, 1]
-        if decode_data.num_decodes > 0:
+        # Decodes run as one single batch with [padded_decode_bs, 1]
+        if num_decodes > 0:
             htorch.core.mark_step()
-            logits = self._execute_model_generic(decode_data.token_ids,
+            logits_device = self._execute_model_generic(decode_data.token_ids,
                                                 decode_data.position_ids,
                                                 decode_data.attn_metadata,
                                                 decode_data.logits_indices)
             if split_sampler:
                 #TODO(kzawora): perform sampling properly
-                decode_output = torch.argmax(logits, dim=1)
+                decode_output_device = torch.argmax(logits_device, dim=1)
             else:
-                decode_output = logits
+                decode_output_device = logits_device
             htorch.core.mark_step()
+
         ######################### PREFILLS #########################
-        # Prefills run separately with shape [1, padded_prefill_len]
-        if num_reqs - decode_data.num_decodes > 0:
+        # Prefills run with shape [padded_prefill_bs, padded_prefill_len]
+        if num_prefills > 0:
             htorch.core.mark_step()
             prefill_output_list = []
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
                     logits_indices) in enumerate(prefill_data.zipped()):
-                logits = self._execute_model_generic(token_ids, position_ids,
+                logits_device = self._execute_model_generic(token_ids, position_ids,
                                                     attn_metadata, logits_indices)
                 if split_sampler:
-                    prefill_tokens = torch.argmax(logits, dim=1)
+                    prefill_tokens = torch.argmax(logits_device, dim=1)
                     prefill_output_list.append(prefill_tokens)
                 else:
-                    prefill_output_list.append(logits)
-            prefill_output = torch.cat(prefill_output_list, dim=0)
+                    prefill_output_list.append(logits_device)
+            prefill_output_device = torch.cat(prefill_output_list, dim=0)
             htorch.core.mark_step()
  
-        ######################### SAMPLING #########################
+        ################### (maybe) SAMPLING ###################
         #NOTE(kzawora): It might be better to do separate sampling
         # for prefills and decodes, since they will have more predictable 
         # shapes. Or it might not. Idk. I implemented both.
         # In my testing, split_sampler=False was a bit faster (Llama3.1-8B@GSM8K), 
         # no differences in accuracy observed. YMMV.
-        model_output = None
-        if decode_output is not None and prefill_output is not None:
-            model_output = torch.cat((decode_output, prefill_output), dim=0)
-        else:
-            model_output = decode_output if decode_output is not None else prefill_output
+        # HPU <-> CPU sync happens in this section
         
+        sampled_token_ids_cpu : torch.Tensor
         if split_sampler:
-            sampled_token_ids = model_output
+            # If sampler was split, we already have tokens. Let's copy the data to CPU as is, and then discard padded tokens.
+            prefill_output_cpu = prefill_output_device.cpu() if prefill_output_device is not None else None
+            decode_output_cpu = decode_output_device.cpu() if decode_output_device is not None else None
+            # From this point onward, all operations are done on CPU.
+
+            # Discard garbage tokens from prefills and/or decodes
+            if prefill_output_cpu is not None and decode_output_cpu is not None:
+                sampled_token_ids_cpu = torch.cat((decode_output_cpu[:num_decodes], prefill_output_cpu[:num_prefills]), dim=0)
+            else:
+                sampled_token_ids_cpu = decode_output_cpu[:num_decodes] if decode_output_cpu is not None else prefill_output_cpu[:num_prefills]
         else:
-            sampled_token_ids = torch.argmax(model_output, dim=1)
+            # If sampler was not split, we need to sample on device before copying to CPU.
+            joint_logits_device : torch.Tensor
+            if decode_output_device is not None and prefill_output_device is not None:
+                joint_logits_device = torch.cat((decode_output_device, prefill_output_device), dim=0)
+            else:
+                joint_logits_device = decode_output_device if decode_output_device is not None else prefill_output_device
+            sampled_token_ids_device = torch.argmax(joint_logits_device, dim=1)
+            sampled_token_ids_padded_cpu = sampled_token_ids_device.cpu()
+            # From this point onward, all operations are done on CPU.
 
-        # HPU <-> CPU sync happens here
-        sampled_token_ids_cpu = sampled_token_ids.cpu()
+            # Discard garbage tokens from prefills and/or decodes
+            # NOTE(kzawora): If we have 3 prefills and 3 decodes, and both 
+            # are padded to 4, the sampled tokens tensor looks as follows:
+            # [ D0, D1, D2, 0, P0, P1, P2, 0]
+            #   ^___^___^      ^___^___^
+            # Here, we're selecting these elements and discard the
+            # padding in the middle (after prefill tokens) and at the end of the 
+            # tensor (after decode tokens)
+            # https://numpy.org/doc/stable/reference/generated/numpy.r_.html
+            sampled_token_ids_cpu = sampled_token_ids_padded_cpu[np.r_[:num_decodes, num_padded_decodes:num_padded_decodes+num_prefills]]
+
         sampled_token_ids_list = sampled_token_ids_cpu.tolist()
-        htorch.core.mark_step()
 
-        ################## UPDATE REQUEST STATE ##################
+        ######### UPDATE REQUEST STATE WITH GENERATED TOKENS #########
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             req_state = self.requests[req_id]
 
