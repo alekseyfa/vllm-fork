@@ -653,22 +653,34 @@ class HPUModelRunner:
 
     def _prepare_sampling(self,
                           scheduler_output: "SchedulerOutput",
-                          prefill_only: bool = False,
-                          decode_only: bool = False,
-                          seq_idx: Optional[int] = None) -> SamplingMetadata:
+                          start_idx: Optional[int] = None,
+                          end_idx: Optional[int] = None,
+                          pad_to: Optional[int] = None) -> SamplingMetadata:
         skip_copy = True
-        if (scheduler_output.finished_req_ids
-                or scheduler_output.preempted_req_ids):
-            skip_copy = False
-        if (scheduler_output.scheduled_new_reqs
-                or scheduler_output.scheduled_resumed_reqs):
-            skip_copy = False
+        if start_idx is None and end_idx is None:
+            if (scheduler_output.finished_req_ids or scheduler_output.preempted_req_ids):
+                skip_copy = False
+            if (scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_resumed_reqs):
+                skip_copy = False
+        else:
+            #TODO(kzawora): something smells... kinda fishy in here
+            req_ids = self.input_batch.req_ids[start_idx:end_idx]
+            finished_req_ids = any([req_id in scheduler_output.finished_req_ids for req_id in req_ids])
+            preempted_req_ids = any([req_id in scheduler_output.preempted_req_ids for req_id in req_ids])
+            scheduled_new_reqs = any([req_id in scheduler_output.scheduled_new_reqs for req_id in req_ids])
+            scheduled_resumed_reqs = any([req_id in scheduler_output.scheduled_resumed_reqs for req_id in req_ids])
+            
+            if (finished_req_ids or preempted_req_ids):
+                skip_copy = False
+            if (scheduled_new_reqs or scheduled_resumed_reqs):
+                skip_copy = False
+
         # Create the sampling metadata.
         sampling_metadata = self.input_batch.make_sampling_metadata(
             skip_copy=skip_copy,
-            prefill_only=prefill_only,
-            decode_only=decode_only,
-            seq_idx=seq_idx)
+            start_idx=start_idx,
+            end_idx=end_idx,
+            pad_to=pad_to)
         return sampling_metadata
 
     def get_habana_paged_attn_buffers(self, block_tables, slot_mapping, bucketing=True):
@@ -1076,7 +1088,7 @@ class HPUModelRunner:
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
         logprob_token_ids = None
         logprobs = None
-        split_sampler = False
+        split_sampler = True
         prefill_output_device = None
         decode_output_device = None
 
@@ -1088,9 +1100,15 @@ class HPUModelRunner:
                                                 decode_data.position_ids,
                                                 decode_data.attn_metadata,
                                                 decode_data.logits_indices)
+            htorch.core.mark_step()
             if split_sampler:
-                #TODO(kzawora): perform sampling properly
-                decode_output_device = torch.argmax(logits_device, dim=1)
+                sampling_metadata = self._prepare_sampling(scheduler_output, start_idx=0, end_idx=num_decodes, pad_to=num_padded_decodes)
+                htorch.core.mark_step()
+                sampler_output = self.model.sample(logits=logits_device, sampling_metadata=sampling_metadata)
+                decode_output_device = sampler_output.sampled_token_ids
+                htorch.core.mark_step()
+                # argmax_output_device = torch.argmax(logits_device[:num_decodes], dim=1)
+                # assert torch.equal(decode_output_device.cpu()[:num_decodes], argmax_output_device.cpu()[:num_decodes])
             else:
                 decode_output_device = logits_device
             htorch.core.mark_step()
@@ -1102,11 +1120,19 @@ class HPUModelRunner:
             prefill_output_list = []
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
                     logits_indices) in enumerate(prefill_data.zipped()):
+                htorch.core.mark_step()
                 logits_device = self._execute_model_generic(token_ids, position_ids,
                                                     attn_metadata, logits_indices)
+                htorch.core.mark_step()
                 if split_sampler:
-                    prefill_tokens = torch.argmax(logits_device, dim=1)
-                    prefill_output_list.append(prefill_tokens)
+                    sampling_metadata = self._prepare_sampling(scheduler_output, start_idx=num_decodes, end_idx=num_decodes+num_prefills, pad_to=token_ids.shape[0])
+                    htorch.core.mark_step()
+                    sampler_output = self.model.sample(logits=logits_device, sampling_metadata=sampling_metadata)
+                    sampled_token_ids_device = sampler_output.sampled_token_ids
+                    htorch.core.mark_step()
+                    prefill_output_list.append(sampled_token_ids_device)
+                    #argmax_output_device = torch.argmax(logits_device, dim=1)
+                    #assert torch.equal(sampled_token_ids_device.cpu()[:num_prefills], argmax_output_device.cpu()[:num_prefills])
                 else:
                     prefill_output_list.append(logits_device)
             prefill_output_device = torch.cat(prefill_output_list, dim=0)
@@ -1139,6 +1165,8 @@ class HPUModelRunner:
                 joint_logits_device = torch.cat((decode_output_device, prefill_output_device), dim=0)
             else:
                 joint_logits_device = decode_output_device if decode_output_device is not None else prefill_output_device
+            # NOTE(kzawora): this stuff is not gonna work
+            assert False, "imma be real, this ain't gonna work chief"
             sampled_token_ids_device = torch.argmax(joint_logits_device, dim=1)
             sampled_token_ids_padded_cpu = sampled_token_ids_device.cpu()
             # From this point onward, all operations are done on CPU.
@@ -1155,7 +1183,6 @@ class HPUModelRunner:
             sampled_token_ids_cpu = sampled_token_ids_padded_cpu[np.r_[:num_decodes, num_padded_decodes:num_padded_decodes+num_prefills]]
 
         sampled_token_ids_list = sampled_token_ids_cpu.tolist()
-
         ######### UPDATE REQUEST STATE WITH GENERATED TOKENS #########
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             req_state = self.requests[req_id]
@@ -1552,45 +1579,91 @@ class InputBatch:
             # Decrement last_req_index since it is now empty.
             last_req_index -= 1
 
-    def make_sampling_metadata(
+    def make_sampling_metadata(self, skip_copy, start_idx:Optional[int]=None, end_idx:Optional[int]=None, pad_to:Optional[int]=None):
+        if start_idx is None and end_idx is None and pad_to is None:
+            return self._make_sampling_metadata_all(skip_copy=skip_copy)
+        return self._make_sampling_metadata_range(skip_copy, start_idx, end_idx, pad_to=pad_to)
+        
+    def _make_sampling_metadata_range(
             self,
             skip_copy: bool = False,
-            prefill_only: bool = False,
-            decode_only: bool = False,
-            seq_idx: Optional[int] = None) -> SamplingMetadata:
-        start_seq = 0
-        end_seq = self.num_reqs
-        if prefill_only:
-            start_seq = self.num_decodes
-            assert not (
-                decode_only or seq_idx
-            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
-        elif decode_only:
-            end_seq = self.num_decodes
-            assert not (
-                prefill_only or seq_idx
-            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
-        elif seq_idx is not None:
-            start_seq = seq_idx
-            end_seq = seq_idx + 1
-            assert not (
-                prefill_only or decode_only
-            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
-
+            start_idx: Optional[int] = None,
+            end_idx: Optional[int] = None,
+            pad_to:Optional[int] = None) -> SamplingMetadata:
+        if start_idx is None:
+            start_idx = 0
+        if end_idx is None:
+            end_idx = self.num_reqs
+        num_seqs = end_idx - start_idx
+        max_num_reqs = len(self.req_ids)
+        padding_needed = max(0, pad_to-num_seqs) 
+        req_ids = self.req_ids[start_idx:end_idx]
         if not skip_copy:
-            self.temperature[start_seq:end_seq].copy_(
-                self.temperature_cpu_tensor[start_seq:end_seq],
+            self.temperature[start_idx:end_idx].copy_(
+                self.temperature_cpu_tensor[start_idx:end_idx],
                 non_blocking=True)
-            self.top_p[start_seq:end_seq].copy_(
-                self.top_p_cpu_tensor[start_seq:end_seq], non_blocking=True)
-            self.top_k[start_seq:end_seq].copy_(
-                self.top_k_cpu_tensor[start_seq:end_seq], non_blocking=True)
+            self.top_p[start_idx:end_idx].copy_(
+                self.top_p_cpu_tensor[start_idx:end_idx], non_blocking=True)
+            self.top_k[start_idx:end_idx].copy_(
+                self.top_k_cpu_tensor[start_idx:end_idx], non_blocking=True)
+ 
+        all_greedy = all([req_id in self.greedy_reqs for req_id in req_ids])
+        all_random = all([req_id in self.random_reqs for req_id in req_ids])
+        if all_greedy and all_random:
+            import pdb; pdb.set_trace() #WTF?!
+        no_top_p = not any([req_id in self.top_p_reqs for req_id in req_ids])
+        no_top_k = not any([req_id in self.top_k_reqs for req_id in req_ids])
+        # NOTE(kzawora): Generators are used by sampler row-wise. If we got a 
+        # generator for element 5, but it's first row in a batch, 
+        # we need to assign that generator to index 0 - hence the
+        # i:generators.get(req_id) rather than req_id:generators.get(req_id) 
+        generators = {i:self.generators.get(req_id, None) for i, req_id in enumerate(range(start_idx, end_idx+padding_needed))}
+        temperature_device = self.temperature[start_idx:end_idx+padding_needed]
+        top_p_device = self.top_p[start_idx:end_idx+padding_needed]
+        tok_k_device = self.top_k[start_idx:end_idx+padding_needed]
+        if padding_needed > 0 and end_idx+padding_needed > max_num_reqs:
+            # NOTE(kzawora): this is janky, but [start_idx:end_idx+padding_needed] 
+            # falls apart once your padding exceeds max_num_reqs (and it happens pretty 
+            # often, you could increase the temperature/topp/topk allocation, but 
+            # you cannot really make any guarantees ahead of time on the amount of padding you'll use)
+            # this is kind of a temporary fix, no idea on its performance impact...
+            temperature_device = torch.empty(pad_to, device=self.temperature.device, dtype=self.temperature.dtype)
+            top_p_device = torch.empty(pad_to, device=self.top_p.device, dtype=self.top_p.dtype)
+            top_k_device = torch.empty(pad_to, device=self.top_k.device, dtype=self.top_k.dtype)
+            # D2D copy
+            temperature_device[:num_seqs].copy_(self.temperature[start_idx:end_idx], non_blocking=True)
+            top_p_device[:num_seqs].copy_(self.top_p[start_idx:end_idx], non_blocking=True)
+            top_k_device[:num_seqs].copy_(self.top_k[start_idx:end_idx], non_blocking=True)
+
         return SamplingMetadata(
-            temperature=self.temperature[start_seq:end_seq],
+            temperature=temperature_device,
+            all_greedy=all_greedy,
+            all_random=all_random,
+            top_p=top_p_device,
+            top_k=tok_k_device,
+            no_top_p=no_top_p,
+            no_top_k=no_top_k,
+            generators=generators,
+            max_num_logprobs=self.max_num_logprobs,
+        )
+        
+    def _make_sampling_metadata_all(
+        self,
+        skip_copy: bool = False,
+    ) -> SamplingMetadata:
+        if not skip_copy:
+            self.temperature[:self.num_reqs].copy_(
+                self.temperature_cpu_tensor[:self.num_reqs], non_blocking=True)
+            self.top_p[:self.num_reqs].copy_(
+                self.top_p_cpu_tensor[:self.num_reqs], non_blocking=True)
+            self.top_k[:self.num_reqs].copy_(
+                self.top_k_cpu_tensor[:self.num_reqs], non_blocking=True)
+        return SamplingMetadata(
+            temperature=self.temperature[:self.num_reqs],
             all_greedy=self.all_greedy,
             all_random=self.all_random,
-            top_p=self.top_p[start_seq:end_seq],
-            top_k=self.top_k[start_seq:end_seq],
+            top_p=self.top_p[:self.num_reqs],
+            top_k=self.top_k[:self.num_reqs],
             no_top_p=self.no_top_p,
             no_top_k=self.no_top_k,
             generators=self.generators,
