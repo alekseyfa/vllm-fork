@@ -1001,7 +1001,10 @@ class HPUModelRunner:
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills 
         # and decodes, we must handle mixed batches. In _update_states we make 
         # sure that first self.input_batch.num_decodes requests are decodes, 
-        # and remaining ones until the end are prefills. 
+        # and remaining ones until the end are prefills. _update_states also 
+        # handles changes in request cache based on scheduler outputs and 
+        # previous iterations (e.g. keeping block tables and context lengths up 
+        # to date, creating, pruning and updating request caches, and some more stuff)
         
         # If num_decodes == self.input_batch.num_reqs, then batch is all decode, and only a single decode forward pass will be executed in this method.
         # If num_decodes == 0, then batch is all prefill, and only prefill forward passes will be executed  in this method.
