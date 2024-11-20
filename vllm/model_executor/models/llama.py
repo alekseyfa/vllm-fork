@@ -352,6 +352,8 @@ class LlamaModel(nn.Module):
                                             kv_caches[i - self.start_layer],
                                             attn_metadata, residual)
             if is_hpu and i % self.config_hidden_layers == 0:
+                torch._dynamo.graph_break()
+            else:
                 htorch.core.mark_step()
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
