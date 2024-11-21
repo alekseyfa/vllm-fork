@@ -1224,7 +1224,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         padding_fn = None
         if self.use_contiguous_pa:
             block_bucket_size = max(max(block_list) + 1, len(block_list))
-            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(len(block_list))
+            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
+                len(block_list))
             indices: List[Any]
             indices = [None] * block_bucket_size
             for i, bid in enumerate(block_list):
@@ -1232,7 +1233,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             padding_fn = lambda tensor, pad_value: gather_list(
                 tensor, indices, pad_value)
         else:
-            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(len(block_list))
+            block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
+                len(block_list))
             padding_fn = lambda tensor, pad_value: pad_list(
                 tensor, block_bucket_size, pad_value)
 
