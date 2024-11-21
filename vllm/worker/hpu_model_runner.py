@@ -1666,7 +1666,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         free_mem = format_bytes(
             HabanaMemoryProfiler.current_free_device_memory())
         dim = "num_blocks"
-        if phase == "Prompt":
+        if "Prompt" in phase:
             dim = "seq_len"
         msg = (f"[Warmup][{phase}][{i+1}/{max_i}] "
                f"batch_size:{batch_size} "
