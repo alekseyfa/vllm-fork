@@ -167,8 +167,8 @@ class HPUWorker:
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
-        with track_graph_compile('HPUWorker.execute_model'):
-            output = self.model_runner.execute_model(scheduler_output)
+        #with track_graph_compile('HPUWorker.execute_model'):
+        output = self.model_runner.execute_model(scheduler_output)
         # TODO(woosuk): Send the output to the engine process.
         return output
 

@@ -1084,11 +1084,11 @@ class HPUModelRunner:
         seq_len = self._seq_len(attn_metadata)
         is_prompt = attn_metadata.is_prompt
         self._check_config(batch_size, seq_len, is_prompt, warmup_mode)
-        #additional_kwargs = {}
-        #if htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
-        #    use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
-        #    additional_kwargs.update(
-        #        {"bypass_hpu_graphs": not use_graphs})
+        additional_kwargs = {}
+        if htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
+            use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+            additional_kwargs.update(
+                {"bypass_hpu_graphs": not use_graphs})
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         hidden_states = self.model.forward(input_ids=token_ids,
                                            positions=position_ids,
@@ -1437,6 +1437,33 @@ class HPUModelRunner:
         max_num_logprobs = 0 # NOTE(kzawora): idk what to set here
         # NOTE(kzawora: do this in a smarter way)
         
+        htorch.core.mark_step()
+        sampling_metadata = SamplingMetadata(
+            temperature=temperature_device,
+            all_greedy=False, # hacky
+            all_random=True, # hacky
+            top_p=top_p_device,
+            top_k=top_k_device,
+            no_top_p=True,
+            no_top_k=True,
+            generators=generators,
+            max_num_logprobs=max_num_logprobs,
+        )
+        tokens_all_random = self.model.sample(logits, sampling_metadata)
+        htorch.core.mark_step()
+        sampling_metadata = SamplingMetadata(
+            temperature=temperature_device,
+            all_greedy=True, # hacky
+            all_random=False, # hacky
+            top_p=top_p_device,
+            top_k=top_k_device,
+            no_top_p=True,
+            no_top_k=True,
+            generators=generators,
+            max_num_logprobs=max_num_logprobs,
+        )
+        tokens_all_greedy = self.model.sample(logits, sampling_metadata)
+        htorch.core.mark_step()
         sampling_metadata = SamplingMetadata(
             temperature=temperature_device,
             all_greedy=False, # hacky
@@ -1448,10 +1475,9 @@ class HPUModelRunner:
             generators=generators,
             max_num_logprobs=max_num_logprobs,
         )
+        tokens_mixed = self.model.sample(logits, sampling_metadata)
         htorch.core.mark_step()
-        tokens = self.model.sample(logits, sampling_metadata)
-        htorch.core.mark_step()
-        return tokens
+        return tokens_all_random, tokens_all_greedy, tokens_mixed
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
         free_mem = format_bytes(
