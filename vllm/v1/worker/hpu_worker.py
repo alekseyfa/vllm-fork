@@ -1,4 +1,5 @@
 """A GPU worker class."""
+from contextlib import contextmanager
 import gc
 import os
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -146,21 +147,28 @@ class HPUWorker:
                 "`gpu_memory_utilization` or decreasing `max_model_len` when "
                 "initializing the engine.")
 
-        self.model_runner.initialize_kv_cache(num_gpu_blocks)
+        with HabanaMemoryProfiler() as m:
+            self.model_runner.initialize_kv_cache(num_gpu_blocks)
+            torch.hpu.synchronize()
+        msg = ("Initializing cache engine "
+               f"took {m.get_summary_string()}")
+        logger.info(msg)
+        self.compile_or_warm_up_model()
 
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model()
+            self.model_runner.warmup_model()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
-
+        
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
-        output = self.model_runner.execute_model(scheduler_output)
+        with track_graph_compile('HPUWorker.execute_model'):
+            output = self.model_runner.execute_model(scheduler_output)
         # TODO(woosuk): Send the output to the engine process.
         return output
 
@@ -201,3 +209,15 @@ def _get_cache_block_size(
         dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
     dtype_size = get_dtype_size(dtype)
     return dtype_size * total
+
+
+@contextmanager
+def track_graph_compile(name: str):
+    import habana_frameworks.torch as htorch
+    from habana_frameworks.torch.hpu.metrics import metric_localcontext
+    with metric_localcontext("graph_compilation") as gc: 
+        yield
+        htorch.hpu.synchronize()
+    if gc.stats()[0][1] != 0:
+        msg = f"[{name}] graph compilation detected: {gc.stats()}"
+        logger.warning(msg)

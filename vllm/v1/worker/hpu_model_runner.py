@@ -1,10 +1,13 @@
 import collections
+from contextlib import contextmanager
+import functools
 import itertools
 import math
+import operator
 import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,6 +31,8 @@ from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
                                          HabanaMemoryProfiler, format_bytes)
 from vllm_hpu_extension.ops import batch2block, block2batch
 import habana_frameworks.torch as htorch
+import habana_frameworks.torch.internal.bridge_config as bc
+
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
 from vllm.v1.engine.detokenizer import Detokenizer
@@ -102,6 +107,33 @@ def read_bucket_settings(phase: str, dim: str, **defaults):
     for e, v, d in zip(env_vars, values, default_values):
         logger.info('%s=%s (default:%s)', e, v, d)
     return values
+
+
+
+def warmup_range(config: Tuple[int, int, int]):
+    """Generate a warmup range.
+
+    Start from bmin and multiply by 2 until you reach bstep.
+    Then, increase the values in the range by the value of bstep until you 
+    reach bmax.
+
+    Example:
+    bmin = 2, bstep = 32, bmax = 64
+    => ramp_up = (2, 4, 8, 16)
+    => stable = (32, 64)
+    => return ramp_up + stable => (2, 4, 8, 16, 32, 64)
+    """
+    bmin, bstep, bmax = config
+    assert bmin <= bmax, ("Min. batch size cannot be greater than max. "
+                          "batch size. If you want to skip warmup, "
+                          "set VLLM_SKIP_WARMUP=true")
+    base = itertools.repeat(2)
+    ramp_up_acc = itertools.accumulate(base, func=operator.mul, initial=bmin)
+    ramp_up_tw = itertools.takewhile(lambda x: x < bstep and x <= bmax, \
+        ramp_up_acc)
+    stable = range(bstep, bmax + 1, bstep)
+    buckets = list(ramp_up_tw) + list(stable)
+    return list(filter(lambda bucket: bucket >= bmin, buckets))
 
 
 def generate_prompt_buckets(bs_bucket_config,
@@ -510,6 +542,7 @@ class HPUModelRunner:
             device="cpu",
         ).to(torch.int32).reshape(1, -1)
 
+        self.max_prefill_batch_size = 2
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'false').lower() == 'true'
         self.seen_configs: set = set()
@@ -522,14 +555,16 @@ class HPUModelRunner:
             self._setup_buckets()
         else:
             logger.info("Bucketing is OFF.")
-
+        self.skip_warmup = os.environ.get('VLLM_SKIP_WARMUP',
+                                          'false').lower() == 'true'
+        
     def _setup_buckets(self) -> None:
         align_bs = lambda x: min(self.max_num_seqs, x)
         #FIXME: The default values should be max_model_len
-        max_prompt_seq = 1024
-        max_decode_seq = 2048
+        max_prompt_seq = self.max_model_len
+        max_decode_seq = self.max_model_len
         self.bucketing_global_state.prompt_bs_bucket_cfg = read_bucket_settings(
-            'prompt', 'bs', min=1, step=align_bs(32), max=64)
+            'prompt', 'bs', min=1, step=align_bs(32), max=self.max_prefill_batch_size)
         self.bucketing_global_state.decode_bs_bucket_cfg = read_bucket_settings(
             'decode', 'bs', min=1, step=align_bs(32), max=self.max_num_seqs)
         self.bucketing_global_state.prompt_seq_bucket_cfg = \
@@ -770,9 +805,8 @@ class HPUModelRunner:
         # PREFILLS are the next num_reqs - num_decodes REQUESTS.
         num_reqs = self.input_batch.num_reqs
         num_decodes = self.input_batch.num_decodes
-        max_prefill_batch_size = 4
-        for idx in range(num_decodes, num_reqs, max_prefill_batch_size):
-            num_prefills = min(idx + max_prefill_batch_size, num_reqs) - idx
+        for idx in range(num_decodes, num_reqs, self.max_prefill_batch_size):
+            num_prefills = min(idx + self.max_prefill_batch_size, num_reqs) - idx
             batch_req_ids = self.input_batch.req_ids[idx:idx + num_prefills]
             prefill_request_ids.append(batch_req_ids)
 
@@ -1044,17 +1078,22 @@ class HPUModelRunner:
                            phase, batch_size, seq_len)
 
     def _execute_model_generic(self, token_ids, position_ids, attn_metadata,
-                               logits_indices):
+                               logits_indices, kv_caches, warmup_mode=False):
         # FORWARD.
         batch_size = token_ids.size(0)
         seq_len = self._seq_len(attn_metadata)
         is_prompt = attn_metadata.is_prompt
-        self._check_config(batch_size, seq_len, is_prompt, False)
+        self._check_config(batch_size, seq_len, is_prompt, warmup_mode)
+        #additional_kwargs = {}
+        #if htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
+        #    use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+        #    additional_kwargs.update(
+        #        {"bypass_hpu_graphs": not use_graphs})
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         hidden_states = self.model.forward(input_ids=token_ids,
                                            positions=position_ids,
                                            attn_metadata=trimmed_attn_metadata,
-                                           kv_caches=self.kv_caches)
+                                           kv_caches=kv_caches)
         #hidden_states = hidden_states[:num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(hidden_states, None)
@@ -1155,7 +1194,7 @@ class HPUModelRunner:
             htorch.core.mark_step()
             logits_device = self._execute_model_generic(
                 decode_data.token_ids, decode_data.position_ids,
-                decode_data.attn_metadata, decode_data.logits_indices)
+                decode_data.attn_metadata, decode_data.logits_indices, self.kv_caches)
             htorch.core.mark_step()
             if split_sampler:
                 sampling_metadata = self._prepare_sampling(
@@ -1184,14 +1223,17 @@ class HPUModelRunner:
                       logits_indices) in enumerate(prefill_data.zipped()):
                 htorch.core.mark_step()
                 logits_device = self._execute_model_generic(
-                    token_ids, position_ids, attn_metadata, logits_indices)
+                    token_ids, position_ids, attn_metadata, logits_indices, self.kv_caches)
                 htorch.core.mark_step()
                 if split_sampler:
+                    num_curr_prefills = token_ids.shape[0]
+                    prefill_seq_offset_start = num_decodes + idx * self.max_prefill_batch_size
+                    prefill_seq_offset_end = prefill_seq_offset_start + num_curr_prefills
                     sampling_metadata = self._prepare_sampling(
                         scheduler_output,
-                        start_idx=num_decodes,
-                        end_idx=num_decodes + num_prefills,
-                        pad_to=token_ids.shape[0])
+                        start_idx=prefill_seq_offset_start,
+                        end_idx=prefill_seq_offset_end,
+                        pad_to=num_curr_prefills)
                     htorch.core.mark_step()
                     sampler_output = self.model.sample(
                         logits=logits_device,
@@ -1202,7 +1244,7 @@ class HPUModelRunner:
                     #argmax_output_device = torch.argmax(logits_device, dim=1)
                     #assert torch.equal(sampled_token_ids_device.cpu()[:num_prefills], argmax_output_device.cpu()[:num_prefills])
                 else:
-                    prefill_output_list.append(logits_device)
+                    prefill_output_list.append(logits_device)                    
             prefill_output_device = torch.cat(prefill_output_list, dim=0)
             htorch.core.mark_step()
 
@@ -1312,63 +1354,323 @@ class HPUModelRunner:
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
 
-    def _dummy_run(self, batch_size: int, seq_len: int,
-                   kv_caches: List[torch.Tensor], is_prompt: bool) -> None:
+    def _use_graphs(self, batch_size, seq_len, is_prompt):
+        if self.model_config.enforce_eager:
+            return False
+        if self.skip_warmup:
+            return True
+        return (batch_size, seq_len, is_prompt) in self.graphed_buckets
+    
+    def log_graph_warmup_summary(self, buckets, is_prompt, total_mem):
+        num_candidates = len(buckets)
+        phase = f'Graph/{"Prompt" if is_prompt else "Decode"}'
+        graphed = list(c[:2] for c in self.graphed_buckets
+                       if c[2] == is_prompt)
+        if num_candidates == 0:
+            num_candidates = 1
+        msg = (f'{phase} captured:{len(graphed)} '
+               f'({100 * len(graphed) / num_candidates:.1f}%) '
+               f'used_mem:{format_bytes(total_mem)} '
+               f'buckets:{sorted(list(graphed))}')
+        logger.info(msg)
+        
+    def warmup_scenario(self,
+                        batch_size,
+                        seq_or_block,
+                        is_prompt,
+                        kv_caches) -> None:
         """Dummy warmup run for memory usage and graph compilation."""
 
-        input_ids = torch.zeros((batch_size, seq_len),
+        query_seq_len = seq_or_block if is_prompt else 1
+        input_ids = torch.zeros((batch_size, query_seq_len),
                                 dtype=torch.int32,
-                                device=self.device)
-        position_ids = torch.zeros((batch_size, seq_len),
-                                   dtype=torch.int32,
-                                   device=self.device)
-        slot_mapping = torch.zeros((batch_size, seq_len),
-                                   dtype=torch.int64,
-                                   device=self.device)
-        block_tables = None if is_prompt else torch.zeros(
-            (batch_size, self.max_num_blocks_per_req),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        context_lens = None if is_prompt else torch.ones(
-            (batch_size, ),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        block_indices, block_offsets = precompute_indices_and_offsets(
-            self.block_size, slot_mapping, True)
-        # TODO(kzawora): form proper hpu attn metadata
-        prefix_block_list_tensor = None
-        attn_metadata = HPUAttentionMetadata(
-            is_prompt=True,
-            block_list=prefix_block_list_tensor,
-            block_mapping=None,
-            block_usage=None,
-            block_indices=block_indices,
-            block_offsets=block_offsets,
-            block_scales=None,
-            block_groups=None,
-            attn_bias=None,
-            seq_lens_tensor=context_lens if is_prompt else None,
-            context_lens_tensor=None if is_prompt else context_lens,
-            num_prefills=batch_size if is_prompt else 0,
-            num_prefill_tokens=batch_size * seq_len if is_prompt else 0,
-            num_decode_tokens=0 if is_prompt else batch_size,
-            slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=
-            None  # FIXME(kzawora): mutli-modality will not work here
-        )
-        selected_token_indices = torch.arange(0,
-                                              seq_len * batch_size,
-                                              device=self.device)
-        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
-        return  # bypass dummy run for now
+                                device='cpu')
+        position_ids = torch.zeros((batch_size, query_seq_len),
+                                dtype=torch.int32,
+                                device='cpu')
+        slot_mapping = torch.zeros((batch_size, query_seq_len),
+                                dtype=torch.int64,
+                                device='cpu')
+        
+        input_ids_device = _async_h2d_tensor_copy(input_ids, self.device)
+        position_ids_device = _async_h2d_tensor_copy(position_ids, self.device)
+        slot_mapping_device = _async_h2d_tensor_copy(slot_mapping, self.device)
+
+        if is_prompt:
+            seq_lens = torch.zeros((batch_size), dtype=torch.int32, device='cpu')
+            seq_lens.fill_(seq_or_block)
+            seq_lens_device = _async_h2d_tensor_copy(seq_lens, self.device)
+            attn_metadata = HPUAttentionMetadata.make_prefill_metadata(
+                seq_lens_tensor=seq_lens_device,
+                num_prefills=batch_size,
+                num_prefill_tokens=batch_size*seq_or_block,
+                slot_mapping=slot_mapping_device
+            )
+        else:
+            block_tables = [x.tolist() for x in np.array_split(np.arange(seq_or_block), batch_size)]
+            block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(block_tables=block_tables, slot_mapping=slot_mapping, bucketing=True)
+            block_list_device = _async_h2d_tensor_copy(block_list, self.device)
+            block_usage_device = _async_h2d_tensor_copy(block_usage, self.device)
+            block_groups_device = _async_h2d_tensor_copy(block_groups, self.device)
+            attn_metadata = HPUAttentionMetadata.make_decode_metadata(
+                block_list=block_list_device,
+                block_usage=block_usage_device,
+                block_groups=block_groups_device,
+                num_decode_tokens=batch_size,
+                slot_mapping=slot_mapping_device
+            )
+            
+        logits_indices = torch.arange(0,batch_size, device='cpu')
+        logits_indices_device = _async_h2d_tensor_copy(logits_indices, self.device)
         # Dummy run.
-        self.model.forward(input_ids=input_ids,
-                           positions=position_ids,
-                           kv_caches=kv_caches,
-                           attn_metadata=trimmed_attn_metadata,
-                           selected_token_indices=selected_token_indices)
+        htorch.core.mark_step()
+        logits = self._execute_model_generic(input_ids_device, position_ids_device, attn_metadata, logits_indices_device, kv_caches, True)
+        # TODO: do sampling on logits, warmup sampler and prefill joiner
+        htorch.core.mark_step()
+        temperature = torch.ones(batch_size, dtype=torch.float32, device='cpu')
+        top_p = torch.ones(batch_size, dtype=torch.float32, device='cpu')
+        top_k = torch.ones(batch_size, dtype=torch.float32, device='cpu')
+        temperature_device = _async_h2d_tensor_copy(temperature, self.device)
+        top_p_device = _async_h2d_tensor_copy(top_p, self.device)
+        top_k_device = _async_h2d_tensor_copy(top_k, self.device)
+        generators = {i:None for i in range(batch_size)} # NOTE(kzawora): idk what to set here
+        max_num_logprobs = 0 # NOTE(kzawora): idk what to set here
+        # NOTE(kzawora: do this in a smarter way)
+        
+        sampling_metadata = SamplingMetadata(
+            temperature=temperature_device,
+            all_greedy=False, # hacky
+            all_random=False, # hacky
+            top_p=top_p_device,
+            top_k=top_k_device,
+            no_top_p=True,
+            no_top_k=True,
+            generators=generators,
+            max_num_logprobs=max_num_logprobs,
+        )
+        htorch.core.mark_step()
+        tokens = self.model.sample(logits, sampling_metadata)
+        htorch.core.mark_step()
+        return tokens
+
+    def log_warmup(self, phase, i, max_i, batch_size, seq_len):
+        free_mem = format_bytes(
+            HabanaMemoryProfiler.current_free_device_memory())
+        dim = "num_blocks"
+        if phase == "Prompt":
+            dim = "seq_len"
+        msg = (f"[Warmup][{phase}][{i+1}/{max_i}] "
+               f"batch_size:{batch_size} "
+               f"{dim}:{seq_len} "
+               f"free_mem:{free_mem}")
+        logger.info(msg)
+
+    def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
+        for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
+            self.log_warmup('Prompt' if is_prompt else 'Decode', i,
+                            len(buckets), batch_size, seq_len)
+            self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
+
+    def warmup_graphs(self,
+                      strategy,
+                      buckets,
+                      is_prompt,
+                      kv_caches,
+                      available_mem,
+                      starting_mem=0,
+                      total_batch_seq=0.001):
+        total_mem = starting_mem
+        idx = 0
+        phase = f'Graph/{"Prompt" if is_prompt else "Decode"}'
+        num_candidates = len(buckets)
+        ordering : Union[Callable[[Any], Tuple[Any, Any]], \
+            Callable[[Any], Tuple[Any, Any, Any]]]
+        if strategy == 'min_tokens':
+            ordering = lambda b: (b[0] * b[1], b[1], b[0])
+        elif strategy == 'max_bs':
+            ordering = lambda b: (-b[0], b[1])
+        else:
+            raise NotImplementedError(
+                f'Unsupported graph allocation strategy: {strategy}')
+        buckets = list(sorted(buckets, key=ordering))
+        captured_all = True
+        for idx, (batch_size, seq_len) in enumerate(buckets):
+            # Graph memory usage is proportional to seq dimension in a batch
+            batch_seq = batch_size * seq_len if is_prompt else batch_size
+            mem_estimate = batch_seq / total_batch_seq * total_mem
+            if mem_estimate >= available_mem:
+                captured_all = False
+                continue
+            graphed_bucket = (batch_size, seq_len, is_prompt)
+            if graphed_bucket in self.graphed_buckets:
+                continue
+            self.graphed_buckets.add(graphed_bucket)
+            self.log_warmup(phase, idx, num_candidates, batch_size, seq_len)
+            with HabanaMemoryProfiler() as mem_prof:
+                self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
+            #TODO(kzawora): align_workers
+            used_mem = mem_prof.consumed_device_memory
+            available_mem -= used_mem
+            total_mem += used_mem
+            total_batch_seq += batch_seq
+
+        return total_mem, total_batch_seq, captured_all
+
+    @torch.inference_mode()
+    def warmup_model(self) -> None:
+        kv_caches = self.kv_caches
+        if profile := os.environ.get('VLLM_PT_PROFILE', None):
+            phase, bs, seq_len, graph = profile.split('_')
+            is_prompt = phase == 'prompt'
+            graphs = graph == 't'
+            if graphs:
+                self.graphed_buckets.add((int(bs), int(seq_len), is_prompt))
+            self.warmup_scenario(int(bs), int(seq_len), is_prompt, kv_caches,
+                                 True)
+            raise AssertionError("Finished profiling")
+        if self.skip_warmup:
+            logger.info("Skipping warmup...")
+            return
+        #self.profiler.start('internal', 'warmup')
+        max_blocks = kv_caches[0][0].size(0)
+
+        self.bucketing_global_state.prompt_buckets, prompt_omitted_buckets = \
+            generate_prompt_buckets(
+            self.bucketing_global_state.prompt_bs_bucket_cfg,
+            self.bucketing_global_state.prompt_seq_bucket_cfg,
+            self.scheduler_config.max_num_batched_tokens)
+
+        msg = (f"Generated {len(self.bucketing_global_state.prompt_buckets)} "
+               f"prompt buckets [bs, seq]: \
+                {list(sorted(self.bucketing_global_state.prompt_buckets))}")
+        logger.info(msg)
+
+        msg = (f"Omitted {len(prompt_omitted_buckets)} "
+               "prompt buckets due to exceeded token budget "
+               f"(max_num_batched_tokens={self.scheduler_config.max_num_batched_tokens})")
+        logger.info(msg)
+
+        msg = f"Omitted prompt buckets: {list(sorted(prompt_omitted_buckets))}"
+        logger.debug(msg)
+
+        self.bucketing_global_state.decode_buckets = generate_decode_buckets(
+            self.bucketing_global_state.decode_bs_bucket_cfg,
+            self.bucketing_global_state.decode_block_bucket_cfg, max_blocks)
+        logger.info("Generated %d decode buckets [bs, total_blocks]: %s",
+                    len(self.bucketing_global_state.decode_buckets),
+                    list(sorted(self.bucketing_global_state.decode_buckets)))
+
+        if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
+            cache_size_limit = len(
+                self.bucketing_global_state.prompt_buckets) + len(
+                    self.bucketing_global_state.decode_buckets) + 1
+            torch._dynamo.config.cache_size_limit = max(
+                cache_size_limit, torch._dynamo.config.cache_size_limit)
+            # Multiply by 8 to follow the original default ratio between
+            # the cache_size_limit and accumulated_cache_size_limit
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                cache_size_limit * 8,
+                torch._dynamo.config.accumulated_cache_size_limit)
+
+        start_mem = HabanaMemoryProfiler.current_device_memory_usage()
+        start_time = time.perf_counter()
+
+        compile_only_mode_context = functools.partial(bc.env_setting,
+                                                      "PT_COMPILE_ONLY_MODE",
+                                                      True)
+        can_use_compile_only_mode = True
+        try:
+            with compile_only_mode_context():
+                pass
+            logger.debug("Using PT_COMPILE_ONLY_MODE.")
+        except KeyError:
+            can_use_compile_only_mode = False
+            logger.warning('Cannot use PT_COMPILE_ONLY_MODE. '
+                           'Warmup time will be negatively impacted. '
+                           'Please update Gaudi Software Suite.')
+        with compile_only_mode_context(
+        ) if can_use_compile_only_mode else contextlib.nullcontext():
+            self.warmup_all_buckets(self.bucketing_global_state.prompt_buckets,
+                                    True, kv_caches)
+            self.warmup_all_buckets(self.bucketing_global_state.decode_buckets,
+                                    False, kv_caches)
+
+            if not self.model_config.enforce_eager and htorch.utils.internal.is_lazy():
+                assert self.mem_margin is not None, \
+                    ("HabanaWorker.determine_num_available_blocks needs "
+                    "to be called before warming up the model.")
+                free_mem = HabanaMemoryProfiler.current_free_device_memory()
+                graph_free_mem = free_mem - self.mem_margin
+                #TODO(kzawora): align_workers
+                graph_free_mem = graph_free_mem
+                prompt_graph_mem_ratio = float(
+                    os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.3'))
+                prompt_available_memory = (prompt_graph_mem_ratio *
+                                           graph_free_mem)
+                decode_available_memory = (graph_free_mem -
+                                           prompt_available_memory)
+                msg = (
+                    f"Using {format_bytes(graph_free_mem)}"
+                    f"/{format_bytes(free_mem)} "
+                    "of free device memory for HPUGraphs, "
+                    f"{format_bytes(prompt_available_memory)} for prompt and "
+                    f"{format_bytes(decode_available_memory)} for decode "
+                    f"(VLLM_GRAPH_PROMPT_RATIO={prompt_graph_mem_ratio})")
+                logger.info(msg)
+                prompt_strategy = os.environ.get('VLLM_GRAPH_PROMPT_STRATEGY',
+                                                 'min_tokens')
+                decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY',
+                                                 'max_bs')
+                mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
+                    self.warmup_graphs(
+                    prompt_strategy, self.bucketing_global_state.prompt_buckets,
+                    True, kv_caches, prompt_available_memory)
+                mem_post_decode, decode_batch_seq, decode_captured_all = \
+                    self.warmup_graphs(
+                    decode_strategy, self.bucketing_global_state.decode_buckets,
+                    False, kv_caches, decode_available_memory)
+
+                # Not all prompt buckets were captured, but all decode buckets
+                # were captured and we have some free graph-allocated space
+                # left. Let's try to use it for capturing more prompt buckets.
+                if (mem_post_decode + mem_post_prompt < graph_free_mem
+                        and not prompt_captured_all and decode_captured_all):
+                    mem_post_prompt, _, prompt_captured_all = (
+                        self.warmup_graphs(
+                            prompt_strategy,
+                            self.bucketing_global_state.prompt_buckets, True,
+                            kv_caches,
+                            graph_free_mem - mem_post_prompt - mem_post_decode,
+                            mem_post_prompt, prompt_batch_seq))
+
+                # Not all decode buckets were captured, but all prompt buckets
+                # were captured and we have some free graph-allocated space
+                # left. Let's try to use it for capturing more decode buckets.
+                if mem_post_decode + mem_post_prompt < graph_free_mem \
+                    and not decode_captured_all \
+                        and prompt_captured_all:
+                    mem_post_decode, _, _ = self.warmup_graphs(
+                        decode_strategy,
+                        self.bucketing_global_state.decode_buckets, False,
+                        kv_caches,
+                        graph_free_mem - mem_post_prompt - mem_post_decode,
+                        mem_post_decode, decode_batch_seq)
+
+                self.log_graph_warmup_summary(
+                    self.bucketing_global_state.prompt_buckets, True,
+                    mem_post_prompt)
+                self.log_graph_warmup_summary(
+                    self.bucketing_global_state.decode_buckets, False,
+                    mem_post_decode)
+
+        end_time = time.perf_counter()
+        end_mem = HabanaMemoryProfiler.current_device_memory_usage()
+        elapsed_time = end_time - start_time
+        msg = (
+            f"Warmup finished in {elapsed_time:.0f} secs, "
+            f"allocated {format_bytes(end_mem - start_mem)} of device memory")
+        logger.info(msg)
+        #self.profiler.end()
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -1384,14 +1686,16 @@ class HPUModelRunner:
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
 
-        # Round to multiple of 16.
-        seq_len = (self.max_num_tokens + 15) // 16 * 16
-
-        # Run empty forward.
-        self._dummy_run(batch_size=1,
-                        seq_len=seq_len,
-                        kv_caches=kv_caches,
-                        is_prompt=True)
+        # Run empty prefill forwards - prefill max batch and prefill max seq 
+        self.warmup_scenario(batch_size=1,
+                        seq_or_block=self.max_model_len,
+                        is_prompt=True,
+                        kv_caches=kv_caches)
+        max_seq_len = math.ceil((self.max_num_tokens//self.max_prefill_batch_size) / self.block_size) * self.block_size
+        self.warmup_scenario(batch_size=self.max_prefill_batch_size,
+                        seq_or_block=max_seq_len,
+                        is_prompt=True,
+                        kv_caches=kv_caches)
         torch.hpu.synchronize()
 
     @torch.inference_mode()
