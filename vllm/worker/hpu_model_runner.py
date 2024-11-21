@@ -765,10 +765,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
         self.seen_configs: set = set()
         self._mem_margin: Optional[int] = None
-        self.bucketing_ctx = HPUBucketingContext(
-            self.scheduler_config.max_num_seqs,
-            self.scheduler_config.max_num_prefill_seqs, self.block_size,
-            self.max_num_batched_tokens)
+        self.bucketing_ctx = HPUBucketingContext(self.max_num_seqs,
+                                                 self.max_num_prefill_seqs,
+                                                 self.block_size,
+                                                 self.max_num_batched_tokens)
         self.graphed_buckets: Set[Any] = set()
 
         self._set_gc_threshold()
@@ -1225,7 +1225,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         if self.use_contiguous_pa:
             block_bucket_size = max(max(block_list) + 1, len(block_list))
             block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
-                len(block_list))
+                block_bucket_size)
             indices: List[Any]
             indices = [None] * block_bucket_size
             for i, bid in enumerate(block_list):
