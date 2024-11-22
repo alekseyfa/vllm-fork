@@ -542,7 +542,7 @@ class HPUModelRunner:
             device="cpu",
         ).to(torch.int32).reshape(1, -1)
 
-        self.max_prefill_batch_size = 2
+        self.max_prefill_batch_size = 16
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'false').lower() == 'true'
         self.seen_configs: set = set()
@@ -1207,8 +1207,6 @@ class HPUModelRunner:
                     logits=logits_device, sampling_metadata=sampling_metadata)
                 decode_output_device = sampler_output.sampled_token_ids
                 htorch.core.mark_step()
-                # argmax_output_device = torch.argmax(logits_device[:num_decodes], dim=1)
-                # assert torch.equal(decode_output_device.cpu()[:num_decodes], argmax_output_device.cpu()[:num_decodes])
             else:
                 decode_output_device = logits_device
             htorch.core.mark_step()
@@ -1241,8 +1239,6 @@ class HPUModelRunner:
                     sampled_token_ids_device = sampler_output.sampled_token_ids
                     htorch.core.mark_step()
                     prefill_output_list.append(sampled_token_ids_device)
-                    #argmax_output_device = torch.argmax(logits_device, dim=1)
-                    #assert torch.equal(sampled_token_ids_device.cpu()[:num_prefills], argmax_output_device.cpu()[:num_prefills])
                 else:
                     prefill_output_list.append(logits_device)                    
             prefill_output_device = torch.cat(prefill_output_list, dim=0)
@@ -2008,8 +2004,9 @@ class InputBatch:
             start_idx = 0
         if end_idx is None:
             end_idx = self.num_reqs
-        num_seqs = end_idx - start_idx
         max_num_reqs = len(self.req_ids)
+        end_idx = min(end_idx,max_num_reqs)
+        num_seqs = end_idx - start_idx
         padding_needed = max(0, pad_to - num_seqs)
         req_ids = self.req_ids[start_idx:end_idx]
         if not skip_copy:
@@ -2041,7 +2038,7 @@ class InputBatch:
                                               padding_needed]
         top_p_device = self.top_p[start_idx:end_idx + padding_needed]
         tok_k_device = self.top_k[start_idx:end_idx + padding_needed]
-        if padding_needed > 0 and end_idx + padding_needed > max_num_reqs:
+        if end_idx + padding_needed >= max_num_reqs:
             # NOTE(kzawora): this is janky, but [start_idx:end_idx+padding_needed]
             # falls apart once your padding exceeds max_num_reqs (and it happens pretty
             # often, you could increase the temperature/topp/topk allocation, but
