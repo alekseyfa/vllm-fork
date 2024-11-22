@@ -1,0 +1,232 @@
+#!/usr/bin/env -S python -u
+
+import argparse
+import fmwork as fmwork
+import torch
+import traceback
+import os
+import sys
+
+'''
+#profile
+os.environ['VLLM_PROMPT_BS_BUCKET_MIN']="1"
+os.environ['VLLM_PROMPT_BS_BUCKET_STEP']="1"
+os.environ['VLLM_PROMPT_BS_BUCKET_MAX']="1"
+
+os.environ['VLLM_PROMPT_SEQ_BUCKET_MIN']="1024"
+os.environ['VLLM_PROMPT_SEQ_BUCKET_STEP']="1024"
+os.environ['VLLM_PROMPT_SEQ_BUCKET_MAX']="1024"
+os.environ['VLLM_DECODE_BS_BUCKET_MIN']="49"#"1"#
+os.environ['VLLM_DECODE_BS_BUCKET_STEP']="49"#"1"
+os.environ['VLLM_DECODE_BS_BUCKET_MAX']="1"#"1"#"512"
+os.environ['VLLM_DECODE_BLOCK_BUCKET_MIN']="1024"#"1024"#"3000"
+os.environ['VLLM_DECODE_BLOCK_BUCKET_MAX']="1024"#"1024"#"3000"
+os.environ['VLLM_DECODE_BLOCK_BUCKET_STEP']="1"
+os.environ['VLLM_PT_PROFILE']='decode_49_1024_t'#'prompt_1_1024_t'#
+'''
+
+class var: pass
+class par: pass
+def main():
+
+    params()
+    llm()
+    runs()
+    done()
+
+def params():
+
+    fmwork.banner('PARAMS')
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('-m', '--model_path',
+        type=str, required=True,
+        default="/scratch4/models/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/41bd4c9e7e4fb318ca40e721131d4933966c2cc1/")
+    parser.add_argument('-i', '--input_size',
+        type=str, required=True)
+    parser.add_argument('-o', '--output_size',
+        type=str, required=True)
+    parser.add_argument('-b', '--batch_size',
+        type=str, required=True)
+    parser.add_argument('-t', '--tensor_parallel',
+        type=int, required=True)
+    parser.add_argument('-r', '--reps',
+        type=int, default=3)
+    parser.add_argument('-d', '--dtype',
+        type=str, default='auto')
+    parser.add_argument('-q', '--quantization',
+        type=str, default=None)
+    parser.add_argument('-k', '--kv_cache_dtype',
+        type=str, default='auto')
+    parser.add_argument('-u', '--gpu_memory_utilization',
+        type=float, default=0.95)
+    parser.add_argument('-e', '--enforce_eager',
+        action='store_true')
+    parser.add_argument('-eds', '--enable_delayed_sampling',
+        action='store_true')
+    parser.add_argument('-hpu', '--hpu',
+        action='store_true')
+    parser.add_argument('-s', '--steps',
+        type=int, default=4)
+    parser.add_argument('-sm', '--save_mem',
+        action='store_true')
+    parser.add_argument('-l', '--max_model_len',
+        type=int, default=-1)
+    parser.add_argument('-st', '--num_scheduler_steps',
+        type=int, default=8)
+    parser.add_argument('-acc', '--test_acc',
+        action='store_true')
+
+
+    parser.parse_args(namespace=par)
+
+    attrs = []
+    for attr in dir(par):
+        if not attr.startswith('__') and not attr.endswith('__'):
+            attrs.append(attr)
+    pad = max([len(x) for x in attrs])
+    for attr in sorted(attrs):
+        print('%-*s = %s' % (
+            pad, attr, getattr(par, attr)))
+
+    var.input_sizes  = list(map(int, par.input_size.split(',')))
+    var.output_sizes = list(map(int, par.output_size.split(',')))
+    var.batch_sizes  = list(map(int, par.batch_size.split(',')))
+    par.max_batch = max(var.batch_sizes)
+    var.test_acc = bool(par.test_acc)
+    if len(var.input_sizes) == 1:
+        par.min_batch = min(var.batch_sizes)
+        #set all env here
+        os.environ['VLLM_PROMPT_BS_BUCKET_MIN'] = str(par.min_batch)
+        os.environ['VLLM_PROMPT_BS_BUCKET_STEP'] = "1"#str(par.max_batch)
+        os.environ['VLLM_PROMPT_BS_BUCKET_MAX'] = str(par.max_batch)
+        os.environ['VLLM_PROMPT_SEQ_BUCKET_MIN'] = str(var.input_sizes[0])
+        os.environ['VLLM_PROMPT_SEQ_BUCKET_STEP'] = str(var.input_sizes[0])
+        os.environ['VLLM_PROMPT_SEQ_BUCKET_MAX'] = str(var.input_sizes[0])
+        os.environ['VLLM_DECODE_BS_BUCKET_MIN'] = str(par.min_batch)
+        os.environ['VLLM_DECODE_BS_BUCKET_STEP'] = "1"
+        os.environ['VLLM_DECODE_BS_BUCKET_MAX'] = str(par.max_batch)
+        os.environ['VLLM_DECODE_BLOCK_BUCKET_MIN'] = str(int(par.min_batch*var.input_sizes[0]/128))
+        os.environ['VLLM_DECODE_BLOCK_BUCKET_STEP'] = str(par.steps)
+        #os.environ['VLLM_DECODE_BLOCK_BUCKET_STEP'] = str(64)
+        os.environ['VLLM_DECODE_BLOCK_BUCKET_MAX'] = str(int(par.max_batch*(var.input_sizes[0]+ var.output_sizes[0])/128)+3*par.steps)#+168)#
+
+        os.environ['VLLM_PROMPT_USE_FUSEDSDPA'] = str('true')
+        if par.tensor_parallel > 1:
+            os.environ['PT_HPU_ENABLE_LAZY_COLLECTIVES'] = str('true')
+        if par.save_mem:
+            #os.environ['PT_HPUGRAPH_DISABLE_TENSOR_CACHE']= str(1)
+            os.environ['VLLM_GRAPH_RESERVED_MEM']= str(0.02)
+        par.max_batched_token = par.max_model_len if int(par.max_model_len) > 0 else par.max_batch*var.input_sizes[0]
+        par.num_scheduler_steps = int(par.num_scheduler_steps)
+        print("libin debug num_scheduler_steps ", par.num_scheduler_steps)
+
+        ######sc
+        os.environ['VLLM_CONTIGUOUS_PA']="true" #without this, acc issue
+
+
+
+def llm():
+    import vllm
+    num_lookahead_slots = 1 if par.num_scheduler_steps==1 else par.num_scheduler_steps-1
+
+    fmwork.banner('LLM')
+    print("libin debug num_scheduler_steps ", par.num_scheduler_steps)
+
+    var.llm = vllm.LLM(
+        dtype                  = par.dtype,
+        enforce_eager          = par.enforce_eager,
+        gpu_memory_utilization = par.gpu_memory_utilization,
+        kv_cache_dtype         = par.kv_cache_dtype,
+        max_model_len          = max(var.input_sizes) + max(var.output_sizes),
+        model                  = par.model_path,
+        quantization           = par.quantization,
+        tensor_parallel_size   = par.tensor_parallel,
+        trust_remote_code      = True,
+        num_lookahead_slots=num_lookahead_slots,#1,
+        use_v2_block_manager=True,
+        #enable_delayed_sampling=True if par.enable_delayed_sampling else None,
+        max_num_seqs=par.max_batch,
+        max_num_batched_tokens=par.max_batched_token,
+        num_scheduler_steps=par.num_scheduler_steps
+    )
+
+def runs():
+
+    for batch_size in var.batch_sizes:
+        for input_size in var.input_sizes:
+            for output_size in var.output_sizes:
+                run(input_size, output_size, batch_size, par.hpu, var.test_acc)
+
+def run(input_size, output_size, batch_size, hpu, test_acc):
+    import vllm
+
+    fmwork.banner(
+        'RUN',
+        input_size,  '/',
+        output_size, '/',
+        batch_size,  '/',
+        par.tensor_parallel, '/',
+        par.steps
+    )
+
+    input_batch = fmwork.input_generator(
+        par.model_path,
+        input_size, batch_size,
+        return_tensors='np',
+        test_acc=test_acc
+    )
+
+    sampling_params = vllm.SamplingParams(
+        max_tokens = output_size,
+        ignore_eos = True,
+    )
+    if test_acc:
+        kwargs = {
+            'prompts' : input_batch,
+            'sampling_params'  : sampling_params,
+            'use_tqdm'         : False,
+        }
+    else:
+       kwargs = {
+            'prompt_token_ids' : input_batch,
+            'sampling_params'  : sampling_params,
+            'use_tqdm'         : False,
+        }
+
+
+    fmwork.reset()
+    #import time
+    for rep in range(par.reps):
+        fmwork.t0()
+        #t0 = time.time()
+        #print("libin start test t0")
+        outputs = var.llm.generate(**kwargs)
+        if hpu:
+            import habana_frameworks.torch.hpu as torch_hpu
+            torch_hpu.synchronize()
+        else:
+            torch.cuda.synchronize()
+        #print("libin start test t1 done sync", time.time()-t0)
+        fmwork.t1(
+            rep, par.reps,
+            input_size, output_size, batch_size,
+            par.tensor_parallel)
+        if test_acc:
+            for output in outputs:
+                print(f'TEST ACC: request id = {output.request_id}')
+                print(f'TEST ACC: prompt = {output.prompt}')
+                print(f'TEST ACC:  response = {output.outputs[0].text}')
+
+def done():
+    fmwork.banner('DONE')
+    print("Waiting to exit gracefully")
+    import signal
+    os.kill(os.getpid(),signal.SIGKILL)
+    import time
+    time.sleep(60)
+    sys.exit()
+
+if __name__ == '__main__': main()
+
