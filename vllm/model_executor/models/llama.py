@@ -314,9 +314,9 @@ class LlamaModel(nn.Module):
         #     print(f"+++++++++++++++++++++++++++++ {i}:  \n", layer)
         #     self.layers[i] = torch.compile(layer, backend='hpu_backend', dynamic=False)
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = torch.compile(RMSNorm(config.hidden_size, eps=config.rms_norm_eps), backend='hpu_backend', dynamic=False)
         else:
-            self.norm = PPMissingLayer()
+            self.norm = torch.compile(PPMissingLayer(), backend='hpu_backend', dynamic=False)
 
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -380,7 +380,7 @@ class LlamaModel(nn.Module):
         for name, loaded_weight in weights:
             if name.startswith("layers."):
                 # print(f"{name}")
-                name = re.sub(r'(layers\.\d+\.)(.*)', r'\1_orig_mod.\2', name)
+                name = re.sub(r'(^layers\.\d+\.)(.*)', r'\1_orig_mod.\2', name)
                 # print(f" replaced to {name}\n")
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -425,7 +425,9 @@ class LlamaModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
                 # print(f"++++load weight +++++++++++++++++++++++++ {name}:  \n")
-                
+
+                name = re.sub(r'(^norm\.)(.*)', r'\1_orig_mod.\2', name)
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
