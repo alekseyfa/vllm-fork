@@ -1658,9 +1658,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     list(sorted(self.bucketing_global_state.decode_buckets)))
 
         if not htorch.utils.internal.is_lazy() and not self.enforce_eager:
-            cache_size_limit = len(
-                self.bucketing_global_state.prompt_buckets) + len(
-                    self.bucketing_global_state.decode_buckets) + 1
+            cache_size_limit = 1290
             torch._dynamo.config.cache_size_limit = max(
                 cache_size_limit, torch._dynamo.config.cache_size_limit)
             # Multiply by 8 to follow the original default ratio between
@@ -1668,6 +1666,9 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             torch._dynamo.config.accumulated_cache_size_limit = max(
                 cache_size_limit * 8,
                 torch._dynamo.config.accumulated_cache_size_limit)
+            print("-------+++++++++++++++++++++++----------------")
+            print(f"Setting cache_size_limit to {torch._dynamo.config.cache_size_limit} accumulated {torch._dynamo.config.accumulated_cache_size_limit}")
+            print("-------+++++++++++++++++++++++----------------")
 
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
