@@ -542,7 +542,9 @@ class HPUModelRunner:
             device="cpu",
         ).to(torch.int32).reshape(1, -1)
 
-        self.max_prefill_batch_size = 16
+        self.max_prefill_batch_size = 16 # TODO(kzawora): add some knob for that
+        self.padding_aware_scheduling = True # TODO(kzawora): add some knob for that
+        self.padding_ratio_threshold = 0.5 # TODO(kzawora): add some knob for that
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'false').lower() == 'true'
         self.seen_configs: set = set()
@@ -788,6 +790,26 @@ class HPUModelRunner:
 
         return block_list, block_groups, block_usage
 
+    def _get_padded_prefill_dims(self, num_prefills, max_prompt_len, bucketing):
+        if bucketing:
+            padded_batch_size = find_bucket(
+                num_prefills,
+                self.bucketing_global_state.prompt_bs_bucket_cfg)
+            padded_prompt_len = find_bucket(
+                max_prompt_len,
+                self.bucketing_global_state.prompt_seq_bucket_cfg)
+        else:
+            #NOTE(kzawora): On HPU prompt length needs to be block_size
+            # aligned, so we're padding to that, even if bucketing
+            # is disabled.
+            padded_batch_size = num_prefills
+            padded_prompt_len = math.ceil(
+                max_prompt_len / self.block_size) * self.block_size
+        assert padded_prompt_len <= self.max_model_len           
+        return padded_batch_size, padded_prompt_len
+
+        
+    
     def _prepare_prefill_inputs(self,
                                 num_scheduled_tokens: List[int],
                                 bucketing=True) -> PrefillInputData:
@@ -805,31 +827,42 @@ class HPUModelRunner:
         # PREFILLS are the next num_reqs - num_decodes REQUESTS.
         num_reqs = self.input_batch.num_reqs
         num_decodes = self.input_batch.num_decodes
-        for idx in range(num_decodes, num_reqs, self.max_prefill_batch_size):
-            num_prefills = min(idx + self.max_prefill_batch_size, num_reqs) - idx
-            batch_req_ids = self.input_batch.req_ids[idx:idx + num_prefills]
-            prefill_request_ids.append(batch_req_ids)
-
-            prompt_lens = num_scheduled_tokens[idx:idx + num_prefills]
-            max_prompt_len = max(num_scheduled_tokens[idx:idx + num_prefills])
+        # NOTE(kzawora): This loop was initially implemented as 
+        # for batch_idx in range(num_decodes, num_reqs, max_prefill_batch_size)
+        # but was changed to accomodate variable loop step size for 
+        # padding-aware scheduling  
+        batch_idx = num_decodes
+        while batch_idx < num_reqs:
+            # Find the largest batch size in range [1, max_prefill_batch_size] 
+            # that can fit within specified token budget
+            num_prefills: int
             padded_batch_size: int
             padded_prompt_len: int
-            if bucketing:
-                padded_batch_size = find_bucket(
-                    num_prefills,
-                    self.bucketing_global_state.prompt_bs_bucket_cfg)
-                padded_prompt_len = find_bucket(
-                    max_prompt_len,
-                    self.bucketing_global_state.prompt_seq_bucket_cfg)
-            else:
-                #NOTE(kzawora): On HPU prompt length needs to be block_size
-                # aligned, so we're padding to that, even if bucketing
-                # is disabled.
-                padded_batch_size = num_prefills
-                padded_prompt_len = math.ceil(
-                    max_prompt_len / self.block_size) * self.block_size
-            prefill_prompt_lens.append(prompt_lens)
-            assert padded_prompt_len <= self.max_model_len
+            padded_num_tokens: int
+            padding_ratio: float
+            batch_req_ids: List[int]
+            prompt_lens: List[int]
+            for possible_batch_size in reversed(range(1, self.max_prefill_batch_size + 1)):
+                if batch_idx + possible_batch_size > num_reqs:
+                    continue
+                num_prefills = possible_batch_size
+                batch_req_ids = self.input_batch.req_ids[batch_idx:batch_idx + num_prefills]
+                prompt_lens = num_scheduled_tokens[batch_idx:batch_idx + num_prefills]
+                max_prompt_len = max(prompt_lens)
+                num_tokens = sum(prompt_lens)
+                padded_batch_size, padded_prompt_len = self._get_padded_prefill_dims(num_prefills, max_prompt_len, bucketing)
+                padded_num_tokens = padded_batch_size * padded_prompt_len
+                padding_ratio = 1 - (num_tokens/padded_num_tokens)
+                is_within_token_budget = padded_batch_size * padded_prompt_len < self.scheduler_config.max_num_batched_tokens
+                is_within_padding_ratio_threshold = padding_ratio < self.padding_ratio_threshold 
+                can_schedule = is_within_token_budget and is_within_padding_ratio_threshold
+                # If padding aware scheduling is off, we'll break on the first 
+                # loop iteration (==max_prefill_batch_size). 
+                # Else, we'll break on first batch size that fits token budget.
+                if not self.padding_aware_scheduling or can_schedule:
+                    break
+            # logger.info(f"Using prefill batch size {num_prefills} padded to [{padded_batch_size}, {padded_prompt_len}] (token budget: {self.scheduler_config.max_num_batched_tokens}, num_tokens: {padded_num_tokens}, padding ratio: {padding_ratio:.2f})")
+
             padded_prompt_lens = [
                 padded_prompt_len for _ in range(padded_batch_size)
             ]
@@ -840,7 +873,7 @@ class HPUModelRunner:
                                     device='cpu')
             token_ids[:num_prefills, :] = torch.from_numpy(
                 self.input_batch.token_ids_cpu[
-                    idx:idx + num_prefills, :padded_prompt_len])
+                    batch_idx:batch_idx + num_prefills, :padded_prompt_len])
 
             # POSITIONS.
             positions = torch.zeros((padded_batch_size, padded_prompt_len),
@@ -857,7 +890,7 @@ class HPUModelRunner:
             flat_prefill_positions = self.prefill_positions.flatten(
             )[:padded_prompt_len]
             block_numbers = self.input_batch.block_table_cpu_tensor[
-                idx:idx + num_prefills,
+                batch_idx:batch_idx + num_prefills,
                 flat_prefill_positions // self.block_size]
             block_offsets = flat_prefill_positions % self.block_size
             slot_mapping[:
@@ -887,7 +920,7 @@ class HPUModelRunner:
             np.cumsum(padded_prompt_lens[:num_prefills],
                       out=query_start_loc_np[1:])
             query_start_loc_np[:num_prefills] += num_scheduled_tokens[
-                idx:idx + num_prefills]
+                batch_idx:batch_idx + num_prefills]
             logits_indices[:num_prefills] = query_start_loc[:num_prefills] - 1
 
             # HPU should *not* sync here with CPU
@@ -905,6 +938,8 @@ class HPUModelRunner:
             logits_indices_device = _async_h2d_tensor_copy(
                 logits_indices, self.device)
 
+            prefill_request_ids.append(batch_req_ids)
+            prefill_prompt_lens.append(prompt_lens)
             prefill_token_ids.append(token_ids_device)
             prefill_position_ids.append(positions_device)
             prefill_logits_indices.append(logits_indices_device)
@@ -917,6 +952,7 @@ class HPUModelRunner:
                     num_prefill_tokens=sum(prompt_lens),
                     slot_mapping=slot_mapping_device,
                 ))
+            batch_idx += num_prefills
 
         return PrefillInputData(request_ids=prefill_request_ids,
                                 prompt_lens=prefill_prompt_lens,
@@ -1214,6 +1250,7 @@ class HPUModelRunner:
         ######################### PREFILLS #########################
         # Prefills run with shape [padded_prefill_bs, padded_prefill_len]
         if num_prefills > 0:
+            prefill_seq_offset_start = num_decodes
             htorch.core.mark_step()
             prefill_output_list = []
             for idx, (req_id, prompt_len, token_ids, position_ids,
@@ -1225,8 +1262,9 @@ class HPUModelRunner:
                 htorch.core.mark_step()
                 if split_sampler:
                     num_curr_prefills = token_ids.shape[0]
-                    prefill_seq_offset_start = num_decodes + idx * self.max_prefill_batch_size
                     prefill_seq_offset_end = prefill_seq_offset_start + num_curr_prefills
+                    if prefill_seq_offset_start == prefill_seq_offset_end:
+                        import pdb; pdb.set_trace()
                     sampling_metadata = self._prepare_sampling(
                         scheduler_output,
                         start_idx=prefill_seq_offset_start,
@@ -1238,6 +1276,7 @@ class HPUModelRunner:
                         sampling_metadata=sampling_metadata)
                     sampled_token_ids_device = sampler_output.sampled_token_ids
                     htorch.core.mark_step()
+                    prefill_seq_offset_end = prefill_seq_offset_start
                     prefill_output_list.append(sampled_token_ids_device)
                 else:
                     prefill_output_list.append(logits_device)                    

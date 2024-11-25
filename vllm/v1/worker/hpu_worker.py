@@ -185,10 +185,13 @@ def init_worker_distributed_environment(
                                  distributed_init_method,
                                  local_rank,
                                  backend='hccl')
-
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
-
+    dummy_tensor_hpu = torch.ones(1).to('hpu')
+    torch.distributed.all_reduce(dummy_tensor_hpu)
+    assert dummy_tensor_hpu.item() == parallel_config.world_size
+    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
+                                      parallel_config.pipeline_parallel_size)
 
 def _get_cache_block_size(
     cache_config: CacheConfig,
