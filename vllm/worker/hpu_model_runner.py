@@ -131,17 +131,22 @@ def flatten(in_list):
     return list(itertools.chain(*in_list))
 
 
-def modify_decoder_layer(module: torch.nn.Module, suffix="DecoderLayer"):
+def modify_decoder_layer(module: torch.nn.Module, name="", suffix="DecoderLayer"):
     if module.__class__.__name__.endswith(suffix):
 
         def forward_hook(module, args, output):
             htorch.core.mark_step()
             return output
 
+        def forward_pre_hook(module, input):
+            htorch.core.mark_step()
+
+        if (name == "0"):
+            module.register_forward_pre_hook(forward_pre_hook)
         module.register_forward_hook(forward_hook)
 
     for child_name, child_module in module.named_children():
-        modify_decoder_layer(child_module)
+        modify_decoder_layer(child_module, child_name)
 
 
 class HpuModelAdapter:
@@ -613,7 +618,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             elif not is_fake_hpu():
                 self.model = self.model.to("hpu")
                 htcore.mark_step()
-            modify_decoder_layer(self.model)
+            #modify_decoder_layer(self.model)
             torch.hpu.synchronize()
 
             with HabanaMemoryProfiler() as m_wrap:
