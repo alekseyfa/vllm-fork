@@ -431,7 +431,7 @@ Feature x Hardware
      - ✅
      - ✅
      - ✅
-     - ✅
+     - ✗
    * - :abbr:`guided dec (Guided Decoding)`
      - ✅
      - ✅
