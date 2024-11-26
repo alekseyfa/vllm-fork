@@ -305,6 +305,7 @@ Feature x Hardware
      - Hopper
      - CPU
      - AMD
+     - Gaudi
    * - :ref:`CP <chunked-prefill>`
      - `✗ <https://github.com/vllm-project/vllm/issues/2729>`__ 
      - ✅
@@ -313,6 +314,7 @@ Feature x Hardware
      - ✅
      - ✗ 
      - ✅
+     - ✗
    * - :ref:`APC <apc>`
      - `✗ <https://github.com/vllm-project/vllm/issues/3687>`__ 
      - ✅
@@ -320,6 +322,7 @@ Feature x Hardware
      - ✅
      - ✅
      - ✗
+     - ✅
      - ✅
    * - :ref:`LoRA <lora>`
      - ✅
@@ -329,6 +332,7 @@ Feature x Hardware
      - ✅
      - `✗ <https://github.com/vllm-project/vllm/pull/4830>`__ 
      - ✅
+     - ✅
    * - :abbr:`prmpt adptr (Prompt Adapter)`
      - ✅
      - ✅
@@ -337,6 +341,7 @@ Feature x Hardware
      - ✅
      - `✗ <https://github.com/vllm-project/vllm/issues/8475>`__ 
      - ✅
+     - ✗
    * - :ref:`SD <spec_decode>`
      - ✅
      - ✅
@@ -353,6 +358,7 @@ Feature x Hardware
      - ✅
      - ✗
      - ✅
+     - ✗
    * - :abbr:`enc-dec (Encoder-Decoder Models)`
      - ✅
      - ✅
@@ -361,7 +367,9 @@ Feature x Hardware
      - ✅
      - ✅
      - ✗
+     - ✅
    * - :abbr:`logP (Logprobs)`
+     - ✅
      - ✅
      - ✅
      - ✅
@@ -377,6 +385,7 @@ Feature x Hardware
      - ✅
      - ✅
      - ✅
+     - ✅
    * - :abbr:`async output (Async Output Processing)`
      - ✅
      - ✅
@@ -385,6 +394,7 @@ Feature x Hardware
      - ✅
      - ✗
      - ✗
+     - ✅
    * - multi-step
      - ✅
      - ✅
@@ -393,7 +403,9 @@ Feature x Hardware
      - ✅
      - `✗ <https://github.com/vllm-project/vllm/issues/8477>`__ 
      - ✅
+     - ✅
    * - :abbr:`MM (Multimodal)`
+     - ✅
      - ✅
      - ✅
      - ✅
@@ -417,7 +429,9 @@ Feature x Hardware
      - ✅
      - ✅
      - ✅
+     - ✅
    * - :abbr:`guided dec (Guided Decoding)`
+     - ✅
      - ✅
      - ✅
      - ✅
