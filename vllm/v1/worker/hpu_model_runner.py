@@ -1,4 +1,5 @@
 import collections
+from enum import Enum
 import functools
 import itertools
 import math
@@ -44,6 +45,11 @@ _TYPE_CACHE = {}
 _PAD_SLOT_ID = 0
 _PAD_BLOCK_ID = 0
 
+class PhaseType(Enum):
+    UNCACHED_PREFILL = 'uncached_prefill'
+    CACHED_PREFILL = 'cached_prefill'
+    DECODE = 'decode'
+    
 
 @dataclass
 class PrefillInputData:
@@ -103,15 +109,15 @@ class HpuModelAdapter:
 
     def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device,
                        dtype):
-        if (attn_metadata is None or self.prefill_use_fusedsdpa
+        prefix_caching_enabled = attn_metadata.is_prompt and attn_metadata.block_list is not None
+        if (attn_metadata is None or (self.prefill_use_fusedsdpa and not prefix_caching_enabled)
                 or not attn_metadata.is_prompt):
             return attn_metadata
 
         prefill_metadata = attn_metadata
 
-        seq_lens_t = prefill_metadata.seq_lens_tensor
         context_lens_t = prefill_metadata.context_lens_tensor
-        query_lens_t = seq_lens_t - context_lens_t
+        query_lens_t = prefill_metadata.seq_lens_tensor
 
         block_list = attn_metadata.block_list
         max_context_len = (block_list.size(-1) //
@@ -672,25 +678,25 @@ class HPUModelRunner:
                 # Else, we'll break on first batch size that fits token budget.
                 if not self.padding_aware_scheduling or can_schedule:
                     break
-            #logger.info(f"Using prefill batch size {num_prefills} padded to [{padded_batch_size}, {padded_prompt_len}] (token budget: {self.scheduler_config.max_num_batched_tokens}, num_tokens: {padded_num_tokens}, padding ratio: {padding_ratio:.2f})")
+            context_lens = self.input_batch.num_computed_tokens_cpu[batch_idx:batch_idx + num_prefills]
+            use_prefix_caching = any(context_lens)
+            # TODO(kzawora): this is an ugly hack for prefix caching, remove that once batch padding works properly (idk why it doesn't)
+            if use_prefix_caching:
+                padded_batch_size = num_prefills
 
             padded_prompt_lens = [
                 padded_prompt_len for _ in range(padded_batch_size)
             ]
+            #logger.info(f"Using {'cached' if use_prefix_caching else 'uncached'} prefill batch size {num_prefills} padded to [{padded_batch_size}, {padded_prompt_len}] with context {max(context_lens)} (token budget: {self.scheduler_config.max_num_batched_tokens}, num_tokens: {padded_num_tokens}, padding ratio: {padding_ratio:.2f})")
 
             # TOKEN_IDS.
             token_ids = torch.zeros((padded_batch_size, padded_prompt_len),
                                     dtype=torch.int32,
                                     device='cpu')
-            token_ids[:num_prefills, :] = torch.from_numpy(
-                self.input_batch.token_ids_cpu[
-                    batch_idx:batch_idx + num_prefills, :padded_prompt_len])
-
             # POSITIONS.
             positions = torch.zeros((padded_batch_size, padded_prompt_len),
                                     dtype=torch.int32,
                                     device='cpu')
-
             # SLOT_MAPPING.
             # The "slot" is the "physical index" of a token in the KV cache.
             # Look up the block_idx in the block table (logical<>physical map)
@@ -698,23 +704,25 @@ class HPUModelRunner:
             slot_mapping = torch.zeros((padded_batch_size, padded_prompt_len),
                                        dtype=torch.int32,
                                        device='cpu')
-            flat_prefill_positions = self.prefill_positions.flatten(
-            )[:padded_prompt_len]
-            block_numbers = self.input_batch.block_table_cpu_tensor[
-                batch_idx:batch_idx + num_prefills,
-                flat_prefill_positions // self.block_size]
-            block_offsets = flat_prefill_positions % self.block_size
-            slot_mapping[:
-                         num_prefills, :] = block_numbers * self.block_size + block_offsets
-            # Set an out of range value for the padding tokens so that they
-            # are ignored when inserting into the KV cache.
+            slot_mapping.fill_(_PAD_SLOT_ID)
+                
+            for i, (prompt_len, context_len) in enumerate(zip(prompt_lens, context_lens)):
+                # Prepare and sanitize token ids (cpu)
+                batch_offset = batch_idx + i
+                token_ids[i, :prompt_len] = torch.from_numpy(self.input_batch.token_ids_cpu[batch_offset, context_len:context_len+prompt_len])
+                #token_ids[i, prompt_len:] = 0 # no need to sanitize - buffer is pre-filled with 0s
+                
+                # Prepare and sanitize positions ids (cpu)
+                positions[i, :prompt_len] = self.prefill_positions[:, context_len:context_len+prompt_len]
+                #positions[i, prompt_len:] = 0 # no need to sanitize - buffer is pre-filled with 0s
 
-            # sanitize out-of-bound token ids and slot mappings, fill positions
-            for i, prompt_len in enumerate(prompt_lens):
-                positions[
-                    i, :prompt_len] = self.prefill_positions[:, :prompt_len]
-                token_ids[i, prompt_len:] = 0
-                slot_mapping[i, prompt_len:] = _PAD_SLOT_ID
+                # Prepare and sanitize slot_mapping (cpu)
+                flat_prefill_positions = positions[i, :prompt_len].flatten()
+                block_numbers = self.input_batch.block_table_cpu_tensor[batch_offset,
+                    flat_prefill_positions // self.block_size]
+                block_offsets = flat_prefill_positions % self.block_size
+                slot_mapping[i, :prompt_len] = block_numbers * self.block_size + block_offsets
+                #slot_mapping[i, prompt_len:] = _PAD_SLOT_ID # no need to sanitize - buffer is pre-filled with _PAD_SLOT_IDs
             slot_mapping = slot_mapping.long()
 
             logits_indices = torch.zeros(padded_batch_size,
@@ -754,15 +762,39 @@ class HPUModelRunner:
             prefill_token_ids.append(token_ids_device)
             prefill_position_ids.append(positions_device)
             prefill_logits_indices.append(logits_indices_device)
-
+            attn_metadata = None
+            if use_prefix_caching:
+                # Prefix caching
+                num_blocks = np.ceil(context_lens / self.block_size).astype(np.int32).tolist()
+                max_num_blocks = max(num_blocks)
+                #if bucketing:
+                #    max_num_blocks = self.bucketing_ctx.get_padded_decode_num_blocks(max_num_blocks)
+                prefix_block_tables = torch.zeros((padded_batch_size, max_num_blocks), dtype=torch.int32,device='cpu')
+                for i, n in enumerate(num_blocks):
+                    prefix_block_tables[i, :n] = self.input_batch.block_table_cpu_tensor[i, :n]
+                context_lens_tensor = torch.zeros((padded_batch_size), dtype=torch.int32, device='cpu')
+                context_lens_tensor[:num_prefills] = torch.tensor(context_lens, device='cpu')
+                
+                block_list_device = _async_h2d_tensor_copy(prefix_block_tables.flatten(), self.device)
+                context_lens_tensor_device = _async_h2d_tensor_copy(context_lens_tensor, self.device)
+                attn_metadata =  HPUAttentionMetadata.make_cached_prefill_metadata(
+                        seq_lens_tensor=seq_lens_tensor_device,
+                        context_lens_tensor=context_lens_tensor_device,
+                        num_prefills=num_prefills,
+                        num_prefill_tokens=sum(prompt_lens),
+                        slot_mapping=slot_mapping_device,
+                        block_list=block_list_device
+                    )
+            else:
+                attn_metadata =  HPUAttentionMetadata.make_prefill_metadata(
+                        seq_lens_tensor=seq_lens_tensor_device,
+                        num_prefills=num_prefills,
+                        num_prefill_tokens=sum(prompt_lens),
+                        slot_mapping=slot_mapping_device,
+                    )
+            #import pdb; pdb.set_trace()
             # ATTN_METADATA.
-            prefill_attn_metadata.append(
-                HPUAttentionMetadata.make_prefill_metadata(
-                    seq_lens_tensor=seq_lens_tensor_device,
-                    num_prefills=num_prefills,
-                    num_prefill_tokens=sum(prompt_lens),
-                    slot_mapping=slot_mapping_device,
-                ))
+            prefill_attn_metadata.append(attn_metadata)
             batch_idx += num_prefills
 
         return PrefillInputData(request_ids=prefill_request_ids,
@@ -910,30 +942,49 @@ class HPUModelRunner:
         )
 
     def _seq_len(self, attn_metadata):
-        if attn_metadata.num_prefills != 0:
-            return attn_metadata.slot_mapping.size(1)
-        else:
-            return attn_metadata.block_list.numel()
+        return attn_metadata.slot_mapping.size(1)
 
-    def _check_config(self, batch_size, seq_len, is_prompt, warmup_mode):
-        cfg = (batch_size, seq_len, is_prompt)
+    def _num_blocks(self, attn_metadata):
+        if attn_metadata.block_list is None:
+            return 0
+        return attn_metadata.block_list.numel()
+    
+    def _phase(self, attn_metadata):
+        phase_type : PhaseType
+        is_prompt = attn_metadata.is_prompt
+        is_prefix_cached = is_prompt and attn_metadata.block_list is not None
+        if is_prompt and is_prefix_cached:
+            phase_type = PhaseType.CACHED_PREFILL
+        elif is_prompt and not is_prefix_cached:
+            phase_type = PhaseType.UNCACHED_PREFILL
+        elif not is_prompt:
+            phase_type = PhaseType.DECODE
+        else:
+            raise ValueError("Unrecognized pass type, likely due to malformed attention metadata")
+        return phase_type
+    
+    def _check_config(self, batch_size, seq_len, num_blocks, attn_metadata, warmup_mode):
+        phase = self._phase(attn_metadata)
+        cfg = (batch_size, seq_len, num_blocks, phase)
         seen = cfg in self.seen_configs
         self.seen_configs.add(cfg)
         if not seen and not warmup_mode:
-            phase = 'prompt' if is_prompt else 'decode'
-            logger.warning("Configuration: (%s, %s, %s) was not warmed-up!",
-                           phase, batch_size, seq_len)
+            phase = phase.value
+            logger.warning("Configuration: (%s, %s, %s, %s) was not warmed-up!",
+                           phase, batch_size, seq_len, num_blocks)
 
     def _execute_model_generic(self, token_ids, position_ids, attn_metadata,
                                logits_indices, kv_caches, warmup_mode=False):
         # FORWARD.
         batch_size = token_ids.size(0)
         seq_len = self._seq_len(attn_metadata)
+        num_blocks = self._num_blocks(attn_metadata)
+        
         is_prompt = attn_metadata.is_prompt
-        self._check_config(batch_size, seq_len, is_prompt, warmup_mode)
+        self._check_config(batch_size, seq_len, num_blocks, attn_metadata, warmup_mode)
         additional_kwargs = {}
         if htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
-            use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+            use_graphs = self._use_graphs(batch_size, seq_len, num_blocks, is_prompt)
             additional_kwargs.update(
                 {"bypass_hpu_graphs": not use_graphs})
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
@@ -1185,6 +1236,7 @@ class HPUModelRunner:
                     f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} {phase} generated token: {self._tokenizer.decode(sampled_token_ids_cpu[req_idx])!r}, all generated so far: {generated!r}'
                 )
         self._ENGINE_ITER += 1
+        #import pdb; pdb.set_trace()
         return model_runner_output
 
     def load_model(self) -> None:
@@ -1200,12 +1252,12 @@ class HPUModelRunner:
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
 
-    def _use_graphs(self, batch_size, seq_len, is_prompt):
+    def _use_graphs(self, batch_size, seq_len, num_blocks, phase):
         if self.model_config.enforce_eager:
             return False
         if self.skip_warmup:
             return True
-        return (batch_size, seq_len, is_prompt) in self.graphed_buckets
+        return (batch_size, seq_len, num_blocks, phase) in self.graphed_buckets
     
     def log_graph_warmup_summary(self, buckets, is_prompt, total_mem):
         num_candidates = len(buckets)
@@ -1522,6 +1574,7 @@ class HPUModelRunner:
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        return
         """Profile to measure peak memory during forward pass."""
 
         # use an empty tensor instead of `None`` to force Dynamo to pass
@@ -1588,7 +1641,8 @@ class HPUModelRunner:
                                       device=self.device)
             kv_layer = (key_cache, value_cache)
             self.kv_caches.append(kv_layer)
-        self.bucketing_ctx.num_hpu_blocks = num_blocks
+        if self.enable_bucketing:
+            self.bucketing_ctx.num_hpu_blocks = num_blocks
         htorch.hpu.synchronize()
 
 

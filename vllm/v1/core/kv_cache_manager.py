@@ -25,7 +25,7 @@ class KVCacheManager:
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
         self.sliding_window = sliding_window
-        self.enable_caching = False
+        self.enable_caching = os.environ.get('VLLM_ENABLE_PREFIX_CACHING', 'true') in ['true', '1']
         # NOTE(woosuk): To avoid frequent block allocation, we preallocate some
         # blocks for each request. For example, when a request reaches the end
         # of its block table, we preallocate N blocks in advance. This way, we

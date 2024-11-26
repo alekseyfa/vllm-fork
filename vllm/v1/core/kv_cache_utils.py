@@ -63,6 +63,7 @@ class FreeKVCacheBlockHeapQueue:
             The first free block.
         """
         block: KVCacheBlock = heapq.heappop(self._free_block_indices)
+        #logger.info(f'[HEAPQ] Popped block {block.block_id}')
         return block
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -142,6 +143,7 @@ class FreeKVCacheBlockQueue:
 
         block = self.free_list_head
         self.remove(block)
+        #logger.info(f'[LL] Popped block {block.block_id}')
         return block
 
     def remove(self, block: KVCacheBlock) -> None:
