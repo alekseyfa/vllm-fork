@@ -1,9 +1,10 @@
 from collections import defaultdict
+import os
 from typing import Dict, List, Optional
 
 from vllm.logger import init_logger
 from vllm.utils import cdiv
-from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockQueue,
+from vllm.v1.core.kv_cache_utils import (BlockHashType, FreeKVCacheBlockHeapQueue, FreeKVCacheBlockQueue,
                                          KVCacheBlock, hash_block_tokens,
                                          hash_request_tokens)
 from vllm.v1.request import Request
@@ -45,7 +46,8 @@ class KVCacheManager:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.block_pool)
+        block_queue_impl = FreeKVCacheBlockHeapQueue if os.environ.get('VLLM_USE_HEAPQ') in ['1', 'true'] else FreeKVCacheBlockQueue
+        self.free_block_queue = block_queue_impl(self.block_pool)
 
         # {block_hash: {block ID: block}}. A cached block is
         # a full block with a block hash that can be used for prefix caching.

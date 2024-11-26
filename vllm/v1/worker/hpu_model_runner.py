@@ -1,12 +1,10 @@
 import collections
-from contextlib import contextmanager
 import functools
 import itertools
 import math
-import operator
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -19,19 +17,20 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
-from vllm.multimodal import MultiModalDataDict
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, cdiv, is_fake_hpu,
-                        is_pin_memory_available, make_tensor_with_pad)
+                        is_pin_memory_available)
 from vllm.v1.attention.backends.hpu_attn import HPUAttentionBackendV1, HPUAttentionMetadata
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
                                          HabanaMemoryProfiler, format_bytes)
+from vllm_hpu_extension.bucketing import HPUBucketingContext
 from vllm_hpu_extension.ops import batch2block, block2batch
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.internal.bridge_config as bc
+from multiprocessing.pool import ThreadPool
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -70,152 +69,6 @@ class DecodeInputData:
     attn_metadata: HPUAttentionMetadata = None
     logits_indices: Optional[torch.Tensor] = None
 
-
-class Singleton(type):
-    _instances: Dict[type, object] = {}
-
-    def __call__(cls, *args, **kwargs):
-        if cls not in cls._instances:
-            cls._instances[cls] = super().__call__(*args, **kwargs)
-        return cls._instances[cls]
-
-
-@dataclass
-class HPUBucketingGlobalState(metaclass=Singleton):
-    prompt_bs_bucket_cfg: Tuple[int, int, int] = field(init=False)
-    decode_bs_bucket_cfg: Tuple[int, int, int] = field(init=False)
-    prompt_seq_bucket_cfg: Tuple[int, int, int] = field(init=False)
-    decode_block_bucket_cfg: Tuple[int, int, int] = field(init=False)
-    prompt_buckets: List[Tuple[int, int]] = field(init=False)
-    decode_buckets: List[Tuple[int, int]] = field(init=False)
-
-
-def read_bucket_settings(phase: str, dim: str, **defaults):
-    """Read bucketing configuration from env variables.
-
-    phase is either 'prompt' or 'decode'
-    dim is either 'bs', 'seq' or 'block'
-    param is either 'min', 'step' or 'max'
-    example env variable: VLLM_DECODE_BS_BUCKET_STEP=128
-    """
-    params = ['min', 'step', 'max']
-    env_vars = [f'VLLM_{phase}_{dim}_BUCKET_{p}'.upper() for p in params]
-    default_values = [defaults[p] for p in params]
-    values = [
-        int(os.environ.get(e, d)) for e, d in zip(env_vars, default_values)
-    ]
-    for e, v, d in zip(env_vars, values, default_values):
-        logger.info('%s=%s (default:%s)', e, v, d)
-    return values
-
-
-
-def warmup_range(config: Tuple[int, int, int]):
-    """Generate a warmup range.
-
-    Start from bmin and multiply by 2 until you reach bstep.
-    Then, increase the values in the range by the value of bstep until you 
-    reach bmax.
-
-    Example:
-    bmin = 2, bstep = 32, bmax = 64
-    => ramp_up = (2, 4, 8, 16)
-    => stable = (32, 64)
-    => return ramp_up + stable => (2, 4, 8, 16, 32, 64)
-    """
-    bmin, bstep, bmax = config
-    assert bmin <= bmax, ("Min. batch size cannot be greater than max. "
-                          "batch size. If you want to skip warmup, "
-                          "set VLLM_SKIP_WARMUP=true")
-    base = itertools.repeat(2)
-    ramp_up_acc = itertools.accumulate(base, func=operator.mul, initial=bmin)
-    ramp_up_tw = itertools.takewhile(lambda x: x < bstep and x <= bmax, \
-        ramp_up_acc)
-    stable = range(bstep, bmax + 1, bstep)
-    buckets = list(ramp_up_tw) + list(stable)
-    return list(filter(lambda bucket: bucket >= bmin, buckets))
-
-
-def generate_prompt_buckets(bs_bucket_config,
-                            seq_bucket_config,
-                            max_num_batched_tokens=None):
-    buckets = list(
-        itertools.product(warmup_range(bs_bucket_config),
-                          warmup_range(seq_bucket_config)))
-    if len(buckets) == 0:
-        msg = ("No buckets could be captured with following config "
-               f"(min, step, max_warmup): "
-               f"bs:{bs_bucket_config}, "
-               f"seq:{seq_bucket_config}")
-        raise ValueError(msg)
-
-    filtered_buckets = buckets
-    if max_num_batched_tokens is not None:
-        # Remove buckets exceeding batch token budget
-        filtered_buckets = list(
-            filter(
-                lambda bucket: bucket[0] * bucket[1] <= max_num_batched_tokens,
-                buckets))
-
-        if len(filtered_buckets) == 0:
-            # we can handle this if we ignore max_num_batched_tokens
-            min_bucket_bs, min_bucket_seq = min(buckets,
-                                                key=lambda b: (b[0] * b[1]))
-            min_reqd_budget = min_bucket_bs * min_bucket_seq
-            msg = (
-                "The current bucketing configuration "
-                f"(min, step, max_warmup): "
-                f"bs:{bs_bucket_config}, "
-                f"seq:{seq_bucket_config} cannot be used with specified "
-                f"max_num_batched_tokens ({max_num_batched_tokens}), as the "
-                f"smallest bucket ({min_reqd_budget}) would exceed token "
-                "budget. Please increase max_num_batched_tokens or decrease "
-                "bucket minimum Ignoring max_num_batched_tokens at risk of "
-                "out-of-memory errors.")
-            logger.error(msg)
-            return list(
-                sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0]))), []
-
-    captured_buckets = list(
-        sorted(filtered_buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
-    omitted_buckets = list(
-        sorted([x for x in buckets if x not in filtered_buckets]))
-    return captured_buckets, omitted_buckets
-
-
-def generate_decode_buckets(bs_bucket_config, blocks_bucket_config,
-                            max_blocks):
-    buckets = []
-    bs_buckets = warmup_range(bs_bucket_config)
-    block_buckets = warmup_range(blocks_bucket_config)
-    bmin, bstep, bmax = blocks_bucket_config
-    last_bucket = max_blocks
-    for bs in bs_buckets:
-        for blocks in block_buckets:
-            if blocks >= last_bucket:
-                buckets.append((bs, last_bucket))
-                break
-            buckets.append((bs, blocks))
-    return list(sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
-
-
-def next_pow2(value: int, base: int):
-    res = base
-    while value > 1:
-        value = (value + 1) // 2
-        res *= 2
-    return res
-
-
-def round_up(value: int, k: int):
-    return (value + k - 1) // k * k
-
-
-def find_bucket(value: int, config: Tuple[int, int, int]):
-    bmin, bstep, _ = config
-    next_step = round_up(value, bstep)
-    next_pow = next_pow2(value, bmin)
-    return max(bmin, min(next_step, next_pow))
 
 
 def flatten(in_list):
@@ -541,66 +394,28 @@ class HPUModelRunner:
             range(self.max_model_len),
             device="cpu",
         ).to(torch.int32).reshape(1, -1)
-
+        
+        self.max_num_seqs = self.scheduler_config.max_num_seqs
         self.max_prefill_batch_size = 16 # TODO(kzawora): add some knob for that
         self.padding_aware_scheduling = True # TODO(kzawora): add some knob for that
-        self.padding_ratio_threshold = 0.5 # TODO(kzawora): add some knob for that
+        self.padding_ratio_threshold = 0.9 # TODO(kzawora): add some knob for that
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
-                                                'false').lower() == 'true'
+                                                'true').lower() == 'true'
         self.seen_configs: set = set()
         self.enable_bucketing = os.environ.get(
             'VLLM_DISABLE_BUCKETING', 'false').lower() not in ['true', '1']
         if self.enable_bucketing:
             logger.info("Bucketing is ON.")
-            self.bucketing_global_state = HPUBucketingGlobalState()
-            self.max_num_seqs = self.scheduler_config.max_num_seqs
-            self._setup_buckets()
+            self.bucketing_ctx = HPUBucketingContext(self.max_num_seqs,
+                                                        self.max_prefill_batch_size,
+                                                        self.block_size,
+                                                        self.scheduler_config.max_num_batched_tokens)
+            self.graphed_buckets: Set[Any] = set()
         else:
             logger.info("Bucketing is OFF.")
         self.skip_warmup = os.environ.get('VLLM_SKIP_WARMUP',
                                           'false').lower() == 'true'
-        
-    def _setup_buckets(self) -> None:
-        align_bs = lambda x: min(self.max_num_seqs, x)
-        #FIXME: The default values should be max_model_len
-        max_prompt_seq = self.max_model_len
-        max_decode_seq = self.max_model_len
-        self.bucketing_global_state.prompt_bs_bucket_cfg = read_bucket_settings(
-            'prompt', 'bs', min=1, step=align_bs(32), max=self.max_prefill_batch_size)
-        self.bucketing_global_state.decode_bs_bucket_cfg = read_bucket_settings(
-            'decode', 'bs', min=1, step=align_bs(32), max=self.max_num_seqs)
-        self.bucketing_global_state.prompt_seq_bucket_cfg = \
-            read_bucket_settings(
-            'prompt',
-            'seq',
-            min=self.block_size,
-            step=self.block_size,
-            max=max_prompt_seq)
-        self.bucketing_global_state.decode_block_bucket_cfg = \
-            read_bucket_settings(
-            'decode',
-            'block',
-            min=self.block_size,
-            step=self.block_size,
-            max=max(self.block_size,
-                    self.max_num_seqs * max_decode_seq // self.block_size))
-        self.graphed_buckets: Set[Any] = set()
 
-        msg = ("Prompt bucket config (min, step, max_warmup) "
-               f"bs:{self.bucketing_global_state.prompt_bs_bucket_cfg}, "
-               f"seq:{self.bucketing_global_state.prompt_seq_bucket_cfg}")
-        logger.info(msg)
-
-        msg = ("Decode bucket config (min, step, max_warmup) "
-               f"bs:{self.bucketing_global_state.decode_bs_bucket_cfg}, "
-               f"block:{self.bucketing_global_state.decode_block_bucket_cfg}")
-        logger.info(msg)
-
-    def find_bucket(value: int, config: Tuple[int, int, int]):
-        bmin, bstep, _ = config
-        next_step = round_up(value, bstep)
-        next_pow = next_pow2(value, bmin)
-        return max(bmin, min(next_step, next_pow))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -756,9 +571,8 @@ class HPUModelRunner:
         if self.use_contiguous_pa:
             block_bucket_size = max(max(block_list) + 1, len(block_list))
             if bucketing:
-                block_bucket_size = find_bucket(
-                    block_bucket_size,
-                    self.bucketing_global_state.decode_block_bucket_cfg)
+                block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
+                    block_bucket_size)
             indices: List[Any]
             indices = [None] * block_bucket_size
             for i, bid in enumerate(block_list):
@@ -768,9 +582,8 @@ class HPUModelRunner:
         else:
             block_bucket_size: int
             if bucketing:
-                block_bucket_size = find_bucket(
-                    len(block_list),
-                    self.bucketing_global_state.decode_block_bucket_cfg)
+                block_bucket_size = self.bucketing_ctx.get_padded_decode_num_blocks(
+                    len(block_list))
             else:
                 block_bucket_size = len(block_list)
             padding_fn = lambda tensor, pad_value: pad_list(
@@ -792,12 +605,10 @@ class HPUModelRunner:
 
     def _get_padded_prefill_dims(self, num_prefills, max_prompt_len, bucketing):
         if bucketing:
-            padded_batch_size = find_bucket(
-                num_prefills,
-                self.bucketing_global_state.prompt_bs_bucket_cfg)
-            padded_prompt_len = find_bucket(
-                max_prompt_len,
-                self.bucketing_global_state.prompt_seq_bucket_cfg)
+            padded_batch_size = self.bucketing_ctx.get_padded_batch_size(
+                num_prefills, True)
+            padded_prompt_len = self.bucketing_ctx.get_padded_prompt_seq_len(
+                max_prompt_len)
         else:
             #NOTE(kzawora): On HPU prompt length needs to be block_size
             # aligned, so we're padding to that, even if bucketing
@@ -861,7 +672,7 @@ class HPUModelRunner:
                 # Else, we'll break on first batch size that fits token budget.
                 if not self.padding_aware_scheduling or can_schedule:
                     break
-            # logger.info(f"Using prefill batch size {num_prefills} padded to [{padded_batch_size}, {padded_prompt_len}] (token budget: {self.scheduler_config.max_num_batched_tokens}, num_tokens: {padded_num_tokens}, padding ratio: {padding_ratio:.2f})")
+            #logger.info(f"Using prefill batch size {num_prefills} padded to [{padded_batch_size}, {padded_prompt_len}] (token budget: {self.scheduler_config.max_num_batched_tokens}, num_tokens: {padded_num_tokens}, padding ratio: {padding_ratio:.2f})")
 
             padded_prompt_lens = [
                 padded_prompt_len for _ in range(padded_batch_size)
@@ -979,8 +790,8 @@ class HPUModelRunner:
         # PAD FOR STATIC SHAPES.
         padded_batch_size: int
         if bucketing:
-            padded_batch_size = find_bucket(
-                num_decodes, self.bucketing_global_state.decode_bs_bucket_cfg)
+            padded_batch_size = self.bucketing_ctx.get_padded_batch_size(
+                num_decodes, False)
         else:
             padded_batch_size = num_decodes
 
@@ -1471,7 +1282,7 @@ class HPUModelRunner:
         generators = {i:None for i in range(batch_size)} # NOTE(kzawora): idk what to set here
         max_num_logprobs = 0 # NOTE(kzawora): idk what to set here
         # NOTE(kzawora: do this in a smarter way)
-        
+        return None
         htorch.core.mark_step()
         sampling_metadata = SamplingMetadata(
             temperature=temperature_device,
@@ -1531,6 +1342,7 @@ class HPUModelRunner:
             self.log_warmup('Prompt' if is_prompt else 'Decode', i,
                             len(buckets), batch_size, seq_len)
             self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
+            torch.hpu.synchronize()
 
     def warmup_graphs(self,
                       strategy,
@@ -1594,37 +1406,12 @@ class HPUModelRunner:
             return
         #self.profiler.start('internal', 'warmup')
         max_blocks = kv_caches[0][0].size(0)
+        self.bucketing_ctx.generate_prompt_buckets()
+        self.bucketing_ctx.generate_decode_buckets(max_blocks)
 
-        self.bucketing_global_state.prompt_buckets, prompt_omitted_buckets = \
-            generate_prompt_buckets(
-            self.bucketing_global_state.prompt_bs_bucket_cfg,
-            self.bucketing_global_state.prompt_seq_bucket_cfg,
-            self.scheduler_config.max_num_batched_tokens)
-
-        msg = (f"Generated {len(self.bucketing_global_state.prompt_buckets)} "
-               f"prompt buckets [bs, seq]: \
-                {list(sorted(self.bucketing_global_state.prompt_buckets))}")
-        logger.info(msg)
-
-        msg = (f"Omitted {len(prompt_omitted_buckets)} "
-               "prompt buckets due to exceeded token budget "
-               f"(max_num_batched_tokens={self.scheduler_config.max_num_batched_tokens})")
-        logger.info(msg)
-
-        msg = f"Omitted prompt buckets: {list(sorted(prompt_omitted_buckets))}"
-        logger.debug(msg)
-
-        self.bucketing_global_state.decode_buckets = generate_decode_buckets(
-            self.bucketing_global_state.decode_bs_bucket_cfg,
-            self.bucketing_global_state.decode_block_bucket_cfg, max_blocks)
-        logger.info("Generated %d decode buckets [bs, total_blocks]: %s",
-                    len(self.bucketing_global_state.decode_buckets),
-                    list(sorted(self.bucketing_global_state.decode_buckets)))
-
-        if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
-            cache_size_limit = len(
-                self.bucketing_global_state.prompt_buckets) + len(
-                    self.bucketing_global_state.decode_buckets) + 1
+        if not htorch.utils.internal.is_lazy() and not self.enforce_eager:
+            cache_size_limit = len(self.bucketing_ctx.prompt_buckets) + len(
+                self.bucketing_ctx.decode_buckets) + 1
             torch._dynamo.config.cache_size_limit = max(
                 cache_size_limit, torch._dynamo.config.cache_size_limit)
             # Multiply by 8 to follow the original default ratio between
@@ -1651,9 +1438,9 @@ class HPUModelRunner:
                            'Please update Gaudi Software Suite.')
         with compile_only_mode_context(
         ) if can_use_compile_only_mode else contextlib.nullcontext():
-            self.warmup_all_buckets(self.bucketing_global_state.prompt_buckets,
+            self.warmup_all_buckets(self.bucketing_ctx.prompt_buckets,
                                     True, kv_caches)
-            self.warmup_all_buckets(self.bucketing_global_state.decode_buckets,
+            self.warmup_all_buckets(self.bucketing_ctx.decode_buckets,
                                     False, kv_caches)
 
             if not self.model_config.enforce_eager and htorch.utils.internal.is_lazy():
@@ -1684,11 +1471,11 @@ class HPUModelRunner:
                                                  'max_bs')
                 mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
                     self.warmup_graphs(
-                    prompt_strategy, self.bucketing_global_state.prompt_buckets,
+                    prompt_strategy, self.bucketing_ctx.prompt_buckets,
                     True, kv_caches, prompt_available_memory)
                 mem_post_decode, decode_batch_seq, decode_captured_all = \
                     self.warmup_graphs(
-                    decode_strategy, self.bucketing_global_state.decode_buckets,
+                    decode_strategy, self.bucketing_ctx.decode_buckets,
                     False, kv_caches, decode_available_memory)
 
                 # Not all prompt buckets were captured, but all decode buckets
@@ -1699,7 +1486,7 @@ class HPUModelRunner:
                     mem_post_prompt, _, prompt_captured_all = (
                         self.warmup_graphs(
                             prompt_strategy,
-                            self.bucketing_global_state.prompt_buckets, True,
+                            self.bucketing_ctx.prompt_buckets, True,
                             kv_caches,
                             graph_free_mem - mem_post_prompt - mem_post_decode,
                             mem_post_prompt, prompt_batch_seq))
@@ -1712,16 +1499,16 @@ class HPUModelRunner:
                         and prompt_captured_all:
                     mem_post_decode, _, _ = self.warmup_graphs(
                         decode_strategy,
-                        self.bucketing_global_state.decode_buckets, False,
+                        self.bucketing_ctx.decode_buckets, False,
                         kv_caches,
                         graph_free_mem - mem_post_prompt - mem_post_decode,
                         mem_post_decode, decode_batch_seq)
 
                 self.log_graph_warmup_summary(
-                    self.bucketing_global_state.prompt_buckets, True,
+                    self.bucketing_ctx.prompt_buckets, True,
                     mem_post_prompt)
                 self.log_graph_warmup_summary(
-                    self.bucketing_global_state.decode_buckets, False,
+                    self.bucketing_ctx.decode_buckets, False,
                     mem_post_decode)
 
         end_time = time.perf_counter()
@@ -1757,7 +1544,6 @@ class HPUModelRunner:
                         seq_or_block=max_seq_len,
                         is_prompt=True,
                         kv_caches=kv_caches)
-        torch.hpu.synchronize()
 
     @torch.inference_mode()
     def capture_model(self) -> None:
@@ -1802,6 +1588,7 @@ class HPUModelRunner:
                                       device=self.device)
             kv_layer = (key_cache, value_cache)
             self.kv_caches.append(kv_layer)
+        self.bucketing_ctx.num_hpu_blocks = num_blocks
         htorch.hpu.synchronize()
 
 
