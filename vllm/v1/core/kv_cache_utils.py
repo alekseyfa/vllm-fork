@@ -1,6 +1,6 @@
 """KV-Cache Utilities."""
 from dataclasses import dataclass, field
-from typing import Deque, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 import heapq
 from vllm.logger import init_logger
 
@@ -51,18 +51,10 @@ class FreeKVCacheBlockHeapQueue:
 
     def __init__(self, blocks: List[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
-        self._free_block_indices: Deque[KVCacheBlock] = blocks[:]
-        self.tombstone = {}
+        self._free_block_indices: List[KVCacheBlock] = blocks[:]
+        self.tombstone: Dict[KVCacheBlock, int] = {}
         heapq.heapify(self._free_block_indices)
         assert len(self._free_block_indices) == self.num_free_blocks
-        # Initialize the doubly linked list of free blocks.
-        self.free_list_head = blocks[0]
-        self.free_list_tail = blocks[-1]
-        for i in range(self.num_free_blocks):
-            if i > 0:
-                blocks[i].prev_free_block = blocks[i - 1]
-            if i < self.num_free_blocks - 1:
-                blocks[i].next_free_block = blocks[i + 1]
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -70,7 +62,7 @@ class FreeKVCacheBlockHeapQueue:
         Returns:
             The first free block.
         """
-        block = heapq.heappop(self._free_block_indices)
+        block: KVCacheBlock = heapq.heappop(self._free_block_indices)
         return block
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -80,7 +72,7 @@ class FreeKVCacheBlockHeapQueue:
             block: The block to remove.
         """
         self.tombstone[block] = self.tombstone.get(block, 0) + 1
-        while len(block) > 0 and self._free_block_indices[0] == block and self.tombstone[block] > 0:
+        while len(self._free_block_indices) > 0 and self._free_block_indices[0] == block and self.tombstone[block] > 0:
             heapq.heappop(self._free_block_indices)
             self.tombstone[block] -= 1
             
