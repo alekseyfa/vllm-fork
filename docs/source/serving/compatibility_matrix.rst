@@ -350,6 +350,7 @@ Feature x Hardware
      - ✅
      - ✅
      - ✅
+     - ✗
    * - CUDA graph
      - ✅
      - ✅
@@ -414,6 +415,7 @@ Feature x Hardware
      - ✅
      - ✅
    * - best-of
+     - ✅
      - ✅
      - ✅
      - ✅
