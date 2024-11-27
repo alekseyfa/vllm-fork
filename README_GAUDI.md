@@ -55,7 +55,7 @@ Currently, the latest features and performance optimizations are developed in Ga
 ```{.console}
 $ git clone https://github.com/HabanaAI/vllm-fork.git
 $ cd vllm-fork
-$ git checkout v.1.19.0
+$ git checkout v1.19.0
 $ pip install -r requirements-hpu.txt
 $ python setup.py develop
 ```
