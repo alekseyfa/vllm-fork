@@ -1,9 +1,9 @@
-from typing import Callable, List, Optional, Tuple, Type
+from typing import Callable, Optional, Tuple, Type
 import torch
 import habana_frameworks.torch  # noqa: F401
 
-from vllm.executor.hpu_executor import HPUExecutor
-from vllm.executor.multiproc_gpu_executor import MultiprocessingGPUExecutor, MultiprocessingGPUExecutorAsync
+from vllm.executor.multiproc_gpu_executor import (
+    MultiprocessingGPUExecutor, MultiprocessingGPUExecutorAsync)
 from vllm.logger import init_logger
 from vllm.utils import make_async
 from vllm.worker.worker_base import WorkerBase

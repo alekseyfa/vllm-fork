@@ -530,7 +530,8 @@ class LLMEngine:
             executor_class = CPUExecutor
         elif engine_config.device_config.device_type == "hpu":
             if distributed_executor_backend == "mp":
-                from vllm.executor.multiproc_hpu_executor import MultiprocessingHPUExecutor
+                from vllm.executor.multiproc_hpu_executor import (
+                    MultiprocessingHPUExecutor)
                 executor_class = MultiprocessingHPUExecutor
             elif distributed_executor_backend == "ray":
                 initialize_ray_cluster(engine_config.parallel_config)
