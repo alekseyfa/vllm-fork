@@ -272,7 +272,7 @@ def precompute_indices_and_offsets(block_size, slot_mapping, is_prompt):
     slot_mapping = slot_mapping.flatten()
     indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
     if is_prompt:
-        indices = indices.unflatten(0, (-1, block_size))[:, 0]
+        indices = indices.unflatten(0, (-1, block_size))[:, 0].clone()
         offsets = None
     else:
         offsets = torch.fmod(slot_mapping, block_size)
