@@ -1,6 +1,7 @@
 from typing import Callable, Optional, Tuple, Type
-import torch
+
 import habana_frameworks.torch  # noqa: F401
+import torch
 
 from vllm.executor.multiproc_gpu_executor import (
     MultiprocessingGPUExecutor, MultiprocessingGPUExecutorAsync)
