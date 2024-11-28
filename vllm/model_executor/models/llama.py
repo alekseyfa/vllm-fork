@@ -305,7 +305,7 @@ class LlamaModel(nn.Module):
             lambda prefix: torch.compile(LlamaDecoderLayer(config=config,
                                              cache_config=cache_config,
                                              quant_config=quant_config,
-                                             prefix=prefix), backend='hpu_backend', dynamic=None),
+                                             prefix=prefix), backend='hpu_backend', dynamic=None, options={"force_static_compile": True}),
             prefix=f"{prefix}.layers",
         )
         # for i in range(self.start_layer, self.end_layer):
@@ -313,9 +313,9 @@ class LlamaModel(nn.Module):
         #     print(f"+++++++++++++++++++++++++++++ {i}:  \n", layer)
         #     self.layers[i] = torch.compile(layer, backend='hpu_backend', dynamic=False)
         if get_pp_group().is_last_rank:
-            self.norm = torch.compile(RMSNorm(config.hidden_size, eps=config.rms_norm_eps), backend='hpu_backend', dynamic=None)
+            self.norm = torch.compile(RMSNorm(config.hidden_size, eps=config.rms_norm_eps), backend='hpu_backend', dynamic=None, options={"force_static_compile": True} )
         else:
-            self.norm = torch.compile(PPMissingLayer(), backend='hpu_backend', dynamic=None)
+            self.norm = torch.compile(PPMissingLayer(), backend='hpu_backend', dynamic=None,  options={"force_static_compile": True})
 
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
