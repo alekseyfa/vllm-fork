@@ -123,6 +123,8 @@ class RotaryEmbedding(CustomOp):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
+        return cos, sin
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
@@ -229,8 +231,7 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from habana_frameworks.torch.hpex.kernels import (
             RotaryPosEmbeddingMode, apply_rotary_pos_emb)
-        if self.sin is None:
-            self.prepare_cos_sin(positions, offsets)
+        self.prepare_cos_sin(positions, offsets)
         num_tokens = positions.shape[0] * positions.shape[1]
         # HPU RoPE kernel requires hidden dimension for cos and sin to be equal
         # to query hidden dimension, so the original tensors need to be
