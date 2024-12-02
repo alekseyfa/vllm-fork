@@ -150,6 +150,11 @@ def run_vllm(
     use_beam_search = False
 
     if not use_beam_search:
+        print("NNNNNNNNNNN extra warmup")
+        start = time.perf_counter()
+        llm.generate(prompts[:128], sampling_params[:128], use_tqdm=True)
+        end = time.perf_counter()
+        print(f"Extra warmup takes {end - start:.2f} seconds")
         start = time.perf_counter()
         llm.generate(prompts, sampling_params, use_tqdm=True)
         end = time.perf_counter()
