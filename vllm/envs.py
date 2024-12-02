@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
     VLLM_USE_RAY_SPMD_WORKER: bool = False
-    VLLM_USE_RAY_COMPILED_DAG: bool = False
+    VLLM_USE_RAY_COMPILED_DAG: bool = True
     VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL: bool = True
     VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
@@ -340,7 +340,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # which optimizes the control plane overhead.
     # Run vLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
     "VLLM_USE_RAY_COMPILED_DAG":
-    lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG", "0"))),
+    lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG", "1"))),
 
     # If the env var is set, it uses NCCL for communication in
     # Ray's compiled DAG. This flag is ignored if
