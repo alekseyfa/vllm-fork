@@ -187,6 +187,7 @@ class Sampler(nn.Module):
         # speculative decoding.
         self.include_gpu_probs_tensor = False
         self.should_modify_greedy_probs_inplace = False
+        self._handle_duplicates = os.getenv('VLLM_HANDLE_TOPK_DUPLICATES','0').lower() in ['1', 'true']
 
     def _init_sampling_tensors(
         self,
@@ -275,21 +276,24 @@ class Sampler(nn.Module):
         logits = logits.to(torch.float)
         logits.div_(sampling_tensors.temperatures.unsqueeze(dim=1))
 
+        use_argmax = self._top_k_scalar == 1 and not self._handle_duplicates
         if do_top_p_top_k and flashinfer_top_k_top_p_sampling is None:
             # If we have a scalar p and k, we can use the optimized version.
-            if self._top_k_scalar and self._top_p_scalar:
-                logits = self._apply_top_k_top_p_opt(logits,
-                                                     self._top_p_scalar,
-                                                     self._top_k_scalar)
-            else:
-                logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
-                                            sampling_tensors.top_ks)
+            if not use_argmax:
+                if self._top_k_scalar and self._top_p_scalar:
+                    logits = self._apply_top_k_top_p_opt(logits,
+                                                        self._top_p_scalar,
+                                                        self._top_k_scalar)
+                else:
+                    logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
+                                                sampling_tensors.top_ks)
 
-        if do_min_p:
+        if do_min_p and not use_argmax:
             logits = _apply_min_p(logits, sampling_tensors.min_ps)
 
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
+        # we dont need softmax for argmax.. but keeping it all the same
         probs = torch.softmax(logits, dim=-1, dtype=torch.float)
         # Compute the log probabilities.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
