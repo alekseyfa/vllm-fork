@@ -178,7 +178,7 @@ class HpuModelAdapter:
         self.dtype = dtype
         if not is_fake_hpu() and not htorch.utils.internal.is_lazy(
         ) and not enforce_eager:
-            if os.getenv("PT_REGIONAL_COMPILATION", 1):
+            if os.getenv('VLLM_REGIONAL_COMPILATION', 'true').lower() == 'true':
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
             else:
