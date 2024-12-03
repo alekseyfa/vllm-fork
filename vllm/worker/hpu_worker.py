@@ -91,7 +91,8 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self.hpu_cache: Optional[List[List[torch.tensor]]] = None
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
-        if os.getenv('VLLM_PROFILER_ENABLED') == 'full' and envs.VLLM_TORCH_PROFILER_DIR:
+        if os.getenv('VLLM_PROFILER_ENABLED'
+                      ) == 'full' and envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
             logger.info("Full profiling enabled. Traces will be saved to: %s",
                         torch_profiler_trace_dir)
@@ -105,24 +106,43 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                         try:
                             os.makedirs(dir_name, exist_ok=True)
                         except Exception as e:
-                            raise RuntimeError("Can't create directory: " + dir_name) from e
+                            raise RuntimeError("Can't create directory: " +
+                                               dir_name) from e
                     file_name = f"vllm.{time.time_ns()}.pt.trace.json"
                     file_path = os.path.join(dir_name, file_name)
                     prof.export_chrome_trace(file_path)
                     with open(file_path) as f:
                         pytorch_trace = json.load(f)
                     base = pytorch_trace['baseTimeNanoseconds'] / 1000
-
+                    profiler = self.model_runner.profiler
                     while True:
                         try:
-                            event_str = self.model_runner.profiler.profiling_trace_events.get_nowait()
-                            event = json.loads(event_str[:-1]) # remove comma at the end
+                            event_str = profiler.profiling_trace_events.get_nowait()
+                            event = json.loads(event_str[:-1]) # remove tail ','
                             event['ts'] = event['ts'] - base
                             pytorch_trace['traceEvents'].append(event)
                         except queue.Empty:
                             break
-                    pytorch_trace['traceEvents'].append({"args":{"name":"vLLM"},"name":"process_name","ph":"M","pid":1,"tid":0,"ts":0.0})
-                    pytorch_trace['traceEvents'].append({"args":{"name":"internal"},"name":"thread_name","ph":"M","pid":1,"tid":3,"ts":0.0})
+                    pytorch_trace['traceEvents'].append({
+                        "args": {
+                            "name": "vLLM"
+                        },
+                        "name": "process_name",
+                        "ph": "M",
+                        "pid": 1,
+                        "tid": 0,
+                        "ts": 0.0
+                    })
+                    pytorch_trace['traceEvents'].append({
+                        "args": {
+                            "name": "internal"
+                        },
+                        "name": "thread_name",
+                        "ph": "M",
+                        "pid": 1,
+                        "tid": 3,
+                        "ts": 0.0
+                    })
 
                     with open(file_path, "w") as outfile:
                         outfile.write(json.dumps(pytorch_trace))
@@ -155,11 +175,12 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     def start_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
-        with self.model_runner.profiler.record_event('internal', 'start_profiler'):
+        high_level_profiler = self.model_runner.profiler
+        with high_level_profiler.record_event('internal', 'start_profiler'):
             # Clean up the queue
             while True:
                 try:
-                    _ = self.model_runner.profiler.profiling_trace_events.get_nowait()
+                    high_level_profiler.profiling_trace_events.get_nowait()
                 except queue.Empty:
                     break
             self.profiler.start()
