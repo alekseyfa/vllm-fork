@@ -1568,9 +1568,9 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.bucketing_ctx.generate_decode_buckets(max_blocks)
 
         if not htorch.utils.internal.is_lazy() and not self.enforce_eager:
-            cache_size_limit = 3 * len(
-                self.bucketing_ctx.prompt_buckets) + 3 * len(
-                    self.bucketing_ctx.decode_buckets) + 1
+            cache_size_limit = 1 + 3 * (
+                len(self.bucketing_ctx.prompt_buckets) +
+                len(self.bucketing_ctx.decode_buckets))
             torch._dynamo.config.cache_size_limit = max(
                 cache_size_limit, torch._dynamo.config.cache_size_limit)
             # Multiply by 8 to follow the original default ratio between
