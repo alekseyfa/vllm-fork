@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
-    VLLM_USE_RAY_SPMD_WORKER: bool = False
+    VLLM_USE_RAY_SPMD_WORKER: bool = True
     VLLM_USE_RAY_COMPILED_DAG: bool = True
     VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL: bool = True
     VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
@@ -334,7 +334,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # execution on all workers.
     # Run vLLM with VLLM_USE_RAY_SPMD_WORKER=1 to enable it.
     "VLLM_USE_RAY_SPMD_WORKER":
-    lambda: bool(int(os.getenv("VLLM_USE_RAY_SPMD_WORKER", "0"))),
+    lambda: bool(int(os.getenv("VLLM_USE_RAY_SPMD_WORKER", "1"))),
 
     # If the env var is set, it uses the Ray's compiled DAG API
     # which optimizes the control plane overhead.
