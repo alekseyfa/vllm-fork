@@ -156,7 +156,7 @@ def run_vllm(
         end = time.perf_counter()
         print(f"Extra warmup takes {end - start:.2f} seconds")
         start = time.perf_counter()
-        llm.generate(prompts, sampling_params, use_tqdm=True)
+        llm.generate(prompts, sampling_params, use_tqdm=True, profiling=True)
         end = time.perf_counter()
     else:
         prompts = [request.prompt for request in requests]
