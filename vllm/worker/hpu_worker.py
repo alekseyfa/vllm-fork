@@ -25,11 +25,12 @@ from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.hpu_model_runner import HPUModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
+from vllm.worker.worker import Worker
 
 logger = init_logger(__name__)
 
 
-class HPUWorker(LocalOrDistributedWorkerBase):
+class HPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HPU.
 
     Each worker is associated with a single HPU. The worker is responsible for
