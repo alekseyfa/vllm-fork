@@ -115,6 +115,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self.profiler = None
 
     def full_trace_handler(self, dir_name, use_gzip=False):
+
         def handler_fn(prof) -> None:
             if not os.path.isdir(dir_name):
                 try:
