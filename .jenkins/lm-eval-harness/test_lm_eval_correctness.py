@@ -68,7 +68,7 @@ def launch_lm_eval(eval_config):
         tasks=[task["name"] for task in eval_config["tasks"]],
         num_fewshot=eval_config["num_fewshot"],
         limit=eval_config["limit"],
-        batch_size="auto",
+        batch_size=1,
         **kwargs)
 
     return results
