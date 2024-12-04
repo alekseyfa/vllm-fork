@@ -47,7 +47,7 @@ class HPUWorker(Worker):
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[HPUModelRunner]] = None,
     ) -> None:
-        WorkerBase.__init__(self, vllm_config=vllm_config)
+        Worker.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
