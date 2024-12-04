@@ -114,11 +114,11 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                     with open(file_path) as f:
                         pytorch_trace = json.load(f)
                     base = pytorch_trace['baseTimeNanoseconds'] / 1000
-                    profiler = self.model_runner.profiler
+                    events = self.model_runner.profiler.profiling_trace_events
                     while True:
                         try:
-                            event_str = profiler.profiling_trace_events.get_nowait()
-                            event = json.loads(event_str[:-1]) # remove tail ','
+                            event_str = events.get_nowait()
+                            event = json.loads(event_str[:-1])
                             event['ts'] = event['ts'] - base
                             pytorch_trace['traceEvents'].append(event)
                         except queue.Empty:
