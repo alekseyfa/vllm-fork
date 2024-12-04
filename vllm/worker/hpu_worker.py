@@ -19,7 +19,8 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.sequence import ExecuteModelRequest
+from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
+                           SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.utils import hpu_backend_string, hpu_device_string, is_fake_hpu
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.hpu_model_runner import HPUModelRunner
@@ -47,7 +48,7 @@ class HPUWorker(Worker):
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[HPUModelRunner]] = None,
     ) -> None:
-        Worker.__init__(self, vllm_config=vllm_config)
+        WorkerBase.__init__(self, vllm_config=vllm_config)
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
@@ -90,6 +91,7 @@ class HPUWorker(Worker):
         self.hpu_cache: Optional[List[List[torch.tensor]]] = None
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
+        self._seq_group_metadata_cache: Dict[str, SequenceGroupMetadata] = {}
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
             logger.info("Profiling enabled. Traces will be saved to: %s",
