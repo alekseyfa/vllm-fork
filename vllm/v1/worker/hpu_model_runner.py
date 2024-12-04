@@ -240,7 +240,7 @@ class HpuModelAdapter:
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(
         HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True
-    ) if False and htorch.utils.internal.is_lazy() else HpuModelAdapter(
+    ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
         *args, **kwargs)
 
 
@@ -458,6 +458,7 @@ class HPUModelRunner:
             start_index = len(req_state.block_ids)
             end_index = start_index + num_new_blocks
             req_state.block_ids.extend(req_data.new_block_ids)
+            # assert (min(end_index, self.input_batch.block_table_cpu.shape[1]) - start_index) == len(req_data.new_block_ids):
             self.input_batch.block_table_cpu[
                 req_index, start_index:end_index] = req_data.new_block_ids
 
@@ -987,6 +988,7 @@ class HPUModelRunner:
             use_graphs = self._use_graphs(batch_size, seq_len, num_blocks, is_prompt)
             additional_kwargs.update(
                 {"bypass_hpu_graphs": not use_graphs})
+            #import pdb; pdb.set_trace()
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         hidden_states = self.model.forward(input_ids=token_ids,
                                            positions=position_ids,
@@ -1692,11 +1694,20 @@ class InputBatch:
         self.num_prompt_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
 
         # Attention-related.
-        self.block_table = torch.zeros((max_num_reqs, max_num_blocks_per_req),
+
+        # NOTE(kzawora): "+1" here prevents us from going OoB in block table 
+        # when max model length is reached. 
+        # Sometimes scheduler allocates two blocks ahead which can go out of 
+        # valid seq len bounds, so e.g. if we have 16 blocks available, and 
+        # we've just filled entirety of 15th block, sometimes scheduler assigns 
+        # 16th and 17th block to the sequence, even though it can never 
+        # reach block 17. I have no idea why that happens, but 
+        # it smells like a bug.
+        self.block_table = torch.zeros((max_num_reqs, max_num_blocks_per_req + 1),
                                        device=self.device,
                                        dtype=torch.int32)
         self.block_table_cpu_tensor = torch.zeros(
-            (max_num_reqs, max_num_blocks_per_req),
+            (max_num_reqs, max_num_blocks_per_req + 1),
             device="cpu",
             dtype=torch.int32,
             pin_memory=pin_memory,
