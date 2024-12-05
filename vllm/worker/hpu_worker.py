@@ -4,7 +4,7 @@
 
 import gc
 import os
-from typing import List, Optional, Set, Tuple, Type
+from typing import List, Optional, Set, Tuple, Type, Dict
 
 import habana_frameworks.torch as htorch  # noqa:F401
 import torch
