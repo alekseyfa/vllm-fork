@@ -12,10 +12,10 @@ stages:
     steps:
       - name: gsm8k_large_g3_tp8
         flavor: g3.s
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=false VLLM_USE_RAY_COMPILED_DAG=false bash run-tests.sh -c configs/models-large.txt -t 2
+        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 2
       - name: gsm8k_large_g2_tp8
         flavor: g2.s
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=false VLLM_USE_RAY_COMPILED_DAG=false bash run-tests.sh -c configs/models-large.txt -t 2
+        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 2
   - name: test_gsm8k_large_models_dag
     steps:
       - name: gsm8k_large_g3_tp8
@@ -28,7 +28,7 @@ stages:
     steps:
       - name: gsm8k_large_g3_tp8
         flavor: g3.l
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=false VLLM_USE_RAY_COMPILED_DAG=false bash run-tests.sh -c configs/models-large.txt -t 8
+        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 8
       - name: gsm8k_large_g2_tp8
         flavor: g2.l
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=false VLLM_USE_RAY_COMPILED_DAG=false bash run-tests.sh -c configs/models-large.txt -t 8
+        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 8
