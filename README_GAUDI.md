@@ -13,7 +13,7 @@ To achieve the best performance, please follow the methods outlined in the
 - Ubuntu 22.04 LTS OS
 - Python 3.10
 - Intel Gaudi accelerator
-- Intel Gaudi software version 1.18.0 and above
+- Intel Gaudi software version 1.19.0 and above
 
 ## Quick Start Using Dockerfile
 Set up the container using the Dockerfile:
@@ -52,19 +52,46 @@ Refer to the [Intel Gaudi documentation](https://docs.habana.ai/en/latest/Instal
 Use the following commands to run a Docker image. Make sure to update the versions below as listed in the [Support Matrix](https://docs.habana.ai/en/latest/Support_Matrix/Support_Matrix.html):
 
 ```{.console}
-$ docker pull vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.4.0:latest
-$ docker run -it --runtime=habana -e HABANA_VISIBLE_DEVICES=all -e OMPI_MCA_btl_vader_single_copy_mechanism=none --cap-add=sys_nice --net=host --ipc=host vault.habana.ai/gaudi-docker/1.18.0/ubuntu22.04/habanalabs/pytorch-installer-2.4.0:latest
+$ docker pull vault.habana.ai/gaudi-docker/1.19.0/ubuntu22.04/habanalabs/pytorch-installer-2.5.1:latest
+$ docker run -it --runtime=habana -e HABANA_VISIBLE_DEVICES=all -e OMPI_MCA_btl_vader_single_copy_mechanism=none --cap-add=sys_nice --net=host --ipc=host vault.habana.ai/gaudi-docker/1.19.0/ubuntu22.04/habanalabs/pytorch-installer-2.5.1:latest
 ```
 
-### Build and Install vLLM-fork
+### Build and Install vLLM
 
-Currently, the latest features and performance optimizations being developed in Gaudi's [vLLM-fork](https://github.com/HabanaAI/vllm-fork) and periodically upstreamed to vLLM main repository.
+Currently, multiple repositories are provided which can be used to install vLLM with Intel® Gaudi®, pick **one** option:
+
+#### 1. Build and Install the stable version from vLLM-fork
+
+vLLM releases are being performed periodically to align with Intel® Gaudi® software releases. The stable version is released with a tag, and supports fully validated features and performance optimizations in Gaudi's [vLLM-fork](https://github.com/HabanaAI/vllm-fork). To install the stable release from [HabanaAI/vLLM-fork](https://github.com/HabanaAI/vllm-fork), run the following:
+
+```{.console}
+$ git clone https://github.com/HabanaAI/vllm-fork.git
+$ cd vllm-fork
+$ git checkout v1.19.0
+$ pip install -r requirements-hpu.txt
+$ python setup.py develop
+```
+
+#### 2. Build and Install the latest from vLLM-fork
+
+Currently, the latest features and performance optimizations are being developed in Gaudi's [vLLM-fork](https://github.com/HabanaAI/vllm-fork) and periodically upstreamed to vLLM main repository.
 To install latest [HabanaAI/vLLM-fork](https://github.com/HabanaAI/vllm-fork), run the following:
 
 ```{.console}
 $ git clone https://github.com/HabanaAI/vllm-fork.git
 $ cd vllm-fork
 $ git checkout habana_main
+$ pip install -r requirements-hpu.txt
+$ python setup.py develop
+```
+
+#### 3. Build and Install from vLLM main source
+
+If you prefer to build and install directly from the main vLLM source, where periodically we are upstreaming new features, run the following:
+
+```{.console}
+$ git clone https://github.com/vllm-project/vllm.git
+$ cd vllm
 $ pip install -r requirements-hpu.txt
 $ python setup.py develop
 ```
@@ -90,7 +117,6 @@ $ python setup.py develop
 # Unsupported Features
 
 - Beam search
-- LoRA adapters
 - AWQ quantization
 - Prefill chunking (mixed-batch inferencing)
 
@@ -127,8 +153,7 @@ Currently in vLLM for HPU we support four execution modes, depending on selected
 | 1                  | 1               | PyTorch lazy mode  |
 
 > [!WARNING]
-> All modes using PT_HPU_LAZY_MODE=0 are experimental and should only be used for validating functional correctness. To achieve the best performance, use HPU Graphs or PyTorch Lazy Mode. Performance
-  improvements are planned for future releases.
+> All modes using PT_HPU_LAZY_MODE=0 are experimental and should only be used for validating functional correctness. To achieve the best performance, use HPU Graphs or PyTorch Lazy Mode. Performance improvements are planned for future releases.
 
 ## Bucketing Mechanism
 
