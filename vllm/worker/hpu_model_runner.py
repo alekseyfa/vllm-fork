@@ -245,7 +245,7 @@ class HpuModelAdapter:
                                            children_name)
 
     def _compile_region(self, model, name, module):
-        module = torch.compile(module, backend='hpu_backend', dynamic=False)
+        module = torch.compile(module, backend='hpu_backend')
         setattr(model, name, module)
 
     def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device,
