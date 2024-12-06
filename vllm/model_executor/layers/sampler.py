@@ -409,7 +409,7 @@ class ApplyToppTopkScalar:
             new_logits = torch.full(logits.shape,
                             -float("inf"),
                             device=logits.device)
-            vals, idx = torch.max(logits, dim=1)
+            vals, idx = torch.max(logits, keepdim=True, dim=1)
             new_logits.scatter_(1, idx, vals.to(new_logits.dtype))
             return new_logits
         if k > ApplyToppTopkScalar._padded_k:
