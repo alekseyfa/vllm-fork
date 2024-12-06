@@ -1,21 +1,21 @@
 # test_config.yaml
 stages:
-  - name: test_gsm8k_large_models_dag
+  - name: test_gsm8k_mss
     steps:
-      - name: gsm8k_large_g3_tp8
+      - name: gsm8k_small_g3_tp2_mss_dag
         flavor: g3.s
-        command: cd .jenkins/lm-eval-harness && bash run-tests.sh -c configs/models-large.txt -t 2
-      - name: gsm8k_large_g2_tp8
+        command: cd .jenkins/lm-eval-harness && bash run-tests.sh -c configs/models-mss.txt -t 2
+      - name: gsm8k_small_g2_tp2_mss
         flavor: g2.s
-        command: cd .jenkins/lm-eval-harness && bash run-tests.sh -c configs/models-large.txt -t 2        
-  - name: test_gsm8k_large_models
+        command: cd .jenkins/lm-eval-harness && bash run-tests.sh -c configs/models-mss.txt -t 2        
+  - name: test_gsm8k_mss
     steps:
-      - name: gsm8k_large_g3_tp8
+      - name: gsm8k_small_g3_tp2_mss
         flavor: g3.s
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 2
-      - name: gsm8k_large_g2_tp8
+        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-mss.txt -t 2
+      - name: gsm8k_small_g2_tp2_mss
         flavor: g2.s
-        command: cd .jenkins/lm-eval-harness && VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0 bash run-tests.sh -c configs/models-large.txt -t 2
+        command: cd .jenkins/lm-eval-harness &&VLLM_USE_RAY_SPMD_WORKER=0 VLLM_USE_RAY_COMPILED_DAG=0  bash run-tests.sh -c configs/models-mss.txt -t 2
   - name: test_gsm8k_large_models_dag
     steps:
       - name: gsm8k_large_g3_tp8
