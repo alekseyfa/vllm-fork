@@ -5,6 +5,7 @@ import torch
 
 from vllm.executor.multiproc_gpu_executor import (
     MultiprocessingGPUExecutor, MultiprocessingGPUExecutorAsync)
+from vllm.executor.multiproc_worker_utils import WorkerMonitor
 from vllm.logger import init_logger
 from vllm.utils import make_async
 from vllm.worker.worker_base import WorkerBase
@@ -12,8 +13,24 @@ from vllm.worker.worker_base import WorkerBase
 logger = init_logger(__name__)
 
 
+def close_with_atexit(func):
+    func()
+    import atexit
+    atexit._run_exitfuncs()
+
+
 class MultiprocessingHPUExecutor(MultiprocessingGPUExecutor):
     """Python multiprocessing-based multi-HPU executor"""
+
+    def _init_executor(self):
+        super()._init_executor()
+        # NOTE(kzawora): This is nasty and it'd be best if it wasn't needed.
+        # Monkey-patch child process shutdown code to execute registered HCCL
+        # atexit teardown code - this will prevent deadlocks during shutdown
+        if isinstance(self.worker_monitor, WorkerMonitor):
+            self.close_process_func = self.worker_monitor.close
+            self.worker_monitor.close = close_with_atexit(  # type: ignore[method-assign]
+                self.close_process_func)
 
     def _get_worker_module_and_class(
             self) -> Tuple[str, str, Optional[Callable[[], Type[WorkerBase]]]]:
