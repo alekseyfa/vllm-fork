@@ -9,8 +9,7 @@ jobs:
   TriggerJenkinsTests:
     runs-on: ubuntu-latest
     steps:
-        - name: Trigger Jenkins Tests
-          run: |
-            curl -s -XPOST -H "Content-Type: application/json" \
-            "${{ secrets.WEBHOOK_URL }}" \
-            -d @"$GITHUB_EVENT_PATH"         
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+      - name: 'Dependency Review'
+        uses: actions/dependency-review-action@v4         
