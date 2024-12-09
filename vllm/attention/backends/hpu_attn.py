@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import vllm_hpu_extension.ops as ops
-from vllm_hpu_extension.utils import Matmul, Softmax, VLLMKVCache
+from vllm_hpu_extension.utils import (Matmul, ModuleFusedSDPA, Softmax,
+                                      VLLMKVCache)
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType)
@@ -20,12 +21,20 @@ from vllm.utils import is_fake_hpu
 
 logger = init_logger(__name__)
 
+HPUFusedSDPA = None
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    HPUFusedSDPA = FusedSDPA
+except ImportError:
+    logger.warning("Could not import HPU FusedSDPA kernel. "
+                   "vLLM will use native implementation.")
+
 
 class HPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "hpu-attn"
+        return "HPU_ATTN"
 
     @staticmethod
     def get_impl_cls() -> Type["HPUAttentionImpl"]:
@@ -117,6 +126,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.block2batch_matmul = Matmul()
         self.k_cache = VLLMKVCache()
         self.v_cache = VLLMKVCache()
+        self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
+            else ModuleFusedSDPA(HPUFusedSDPA)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.sliding_window = sliding_window
         self.alibi_slopes = alibi_slopes
@@ -149,7 +160,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         attn_metadata: HPUAttentionMetadata,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        attn_type: AttentionType = AttentionType.DECODER,
+        attn_type: str = AttentionType.DECODER,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
@@ -222,6 +234,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                     softmax_op=self.softmax,
                     matmul_av_op=self.matmul_av,
                     valid_seq_lengths=attn_metadata.seq_lens_tensor,
+                    fsdpa_op=self.fused_scaled_dot_product_attention,
                 )
             else:
                 # TODO: enable FusedSDPA
