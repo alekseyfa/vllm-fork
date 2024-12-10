@@ -105,9 +105,9 @@ class LLMEngine:
 
     @classmethod
     def _get_executor_cls(cls, vllm_config: VllmConfig):
+        distributed_executor_backend = (
+            vllm_config.parallel_config.distributed_executor_backend)
         if current_platform.is_cuda_alike():
-            distributed_executor_backend = (
-                vllm_config.parallel_config.distributed_executor_backend)
             if distributed_executor_backend == "mp":
                 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
                 executor_class = MultiprocExecutor
@@ -116,8 +116,13 @@ class LLMEngine:
                 from vllm.v1.executor.uniproc_executor import UniprocExecutor
                 executor_class = UniprocExecutor
         elif current_platform.is_hpu():
-            from vllm.v1.executor.uniproc_hpu_executor import UniprocHPUExecutor
-            executor_class = UniprocHPUExecutor
+            if distributed_executor_backend == "mp":
+                from vllm.v1.executor.multiproc_hpu_executor import MultiprocHPUExecutor
+                executor_class = MultiprocHPUExecutor
+            else:
+                assert (distributed_executor_backend is None)
+                from vllm.v1.executor.uniproc_hpu_executor import UniprocHPUExecutor
+                executor_class = UniprocHPUExecutor
 
         return executor_class
 
