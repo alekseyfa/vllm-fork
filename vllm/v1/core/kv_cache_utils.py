@@ -1,6 +1,6 @@
 """KV-Cache Utilities."""
-from dataclasses import dataclass
 import heapq
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from vllm.logger import init_logger
@@ -78,10 +78,11 @@ class FreeKVCacheBlockHeapQueue:
             block: The block to remove.
         """
         self.tombstone[block] = self.tombstone.get(block, 0) + 1
-        while len(self._free_block_indices) > 0 and self._free_block_indices[0] == block and self.tombstone[block] > 0:
+        while len(self._free_block_indices) > 0 and self._free_block_indices[
+                0] == block and self.tombstone[block] > 0:
             heapq.heappop(self._free_block_indices)
             self.tombstone[block] -= 1
-            
+
         self.num_free_blocks -= 1
 
     def append(self, block: KVCacheBlock) -> None:

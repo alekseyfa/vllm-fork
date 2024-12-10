@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, AsyncGenerator, Dict, List, Mapping, Optional, Type, Union
+from typing import AsyncGenerator, Dict, List, Mapping, Optional, Type, Union
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -130,9 +130,11 @@ class AsyncLLM(EngineClient):
     def _get_executor_cls(cls, vllm_config: VllmConfig):
         distributed_executor_backend = (
             vllm_config.parallel_config.distributed_executor_backend)
+        executor_class: Type[Executor]
         if current_platform.is_cuda_alike():
             if distributed_executor_backend == "mp":
-                from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+                from vllm.v1.executor.multiproc_executor import (
+                    MultiprocExecutor)
                 executor_class = MultiprocExecutor
             else:
                 assert (distributed_executor_backend is None)
@@ -140,11 +142,13 @@ class AsyncLLM(EngineClient):
                 executor_class = UniprocExecutor
         elif current_platform.is_hpu():
             if distributed_executor_backend == "mp":
-                from vllm.v1.executor.multiproc_hpu_executor import MultiprocHPUExecutor
+                from vllm.v1.executor.multiproc_hpu_executor import (
+                    MultiprocHPUExecutor)
                 executor_class = MultiprocHPUExecutor
             else:
                 assert (distributed_executor_backend is None)
-                from vllm.v1.executor.uniproc_hpu_executor import UniprocHPUExecutor
+                from vllm.v1.executor.uniproc_hpu_executor import (
+                    UniprocHPUExecutor)
                 executor_class = UniprocHPUExecutor
 
         return executor_class

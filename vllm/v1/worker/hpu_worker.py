@@ -1,13 +1,14 @@
 """A GPU worker class."""
-from contextlib import contextmanager
 import gc
 import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.distributed
-import vllm.envs as envs
+from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment)
@@ -18,7 +19,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.hpu_model_runner import HPUModelRunner
 
 logger = init_logger(__name__)
-from vllm_hpu_extension.profiler import HabanaMemoryProfiler, format_bytes
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -72,7 +72,6 @@ class HPUWorker:
         else:
             self.profiler = None
 
-
     def initialize(self):
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.parallel_config, self.rank,
@@ -81,6 +80,7 @@ class HPUWorker:
         # Set random seed.
         set_random_seed(self.model_config.seed)
         self.model_runner = HPUModelRunner(self.vllm_config)
+
     def load_model(self) -> None:
         self.model_runner.load_model()
 
@@ -177,7 +177,7 @@ class HPUWorker:
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
-        
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -210,6 +210,7 @@ def init_worker_distributed_environment(
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
+
 def _get_cache_block_size(
     cache_config: CacheConfig,
     model_config: ModelConfig,
@@ -235,7 +236,7 @@ def _get_cache_block_size(
 def track_graph_compile(name: str):
     import habana_frameworks.torch as htorch
     from habana_frameworks.torch.hpu.metrics import metric_localcontext
-    with metric_localcontext("graph_compilation") as gc: 
+    with metric_localcontext("graph_compilation") as gc:
         yield
         htorch.hpu.synchronize()
     if gc.stats()[0][1] != 0:

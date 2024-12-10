@@ -30,8 +30,8 @@ class Scheduler:
         lora_config: Optional[LoRAConfig],
     ) -> None:
         # TODO: properly handle for HPU.
-#        cache_config.enable_prefix_caching = False
-#        scheduler_config.chunked_prefill_enabled = False
+        #        cache_config.enable_prefix_caching = False
+        #        scheduler_config.chunked_prefill_enabled = False
 
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config

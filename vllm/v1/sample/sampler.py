@@ -24,7 +24,7 @@ class Sampler(nn.Module):
             logits) if not sampling_metadata.all_greedy else logits
         sampled = self.sample(probs, sampling_metadata)
         # Use int32 to reduce the tensor size.
-        sampled = sampled  # .to(torch.int32) NOTE(kzawora): WHY DO WE HAVE AN UNDEFINED BEHAVIOR HERE?! IN WHICH WORLD DOES 75696 INT64 CAST TO -828218624 INT32?!? HOW CAN ARGMAX EVEN RETURN -828218624?! >_<
+        sampled = sampled  # .to(torch.int32) NOTE(kzawora): WHY DO WE HAVE AN UNDEFINED BEHAVIOR HERE?! IN WHICH WORLD DOES 75696 INT64 CAST TO -828218624 INT32?!? HOW CAN ARGMAX EVEN RETURN -828218624?! >_< # NOQA
 
         if sampling_metadata.max_num_logprobs > 0:
             logprobs = self.get_logprobs(logits)

@@ -104,8 +104,9 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
                    slot_mapping=slot_mapping)
 
     @classmethod
-    def make_cached_prefill_metadata(cls, seq_lens_tensor, context_lens_tensor, num_prefills,
-                              num_prefill_tokens, slot_mapping, block_list):
+    def make_cached_prefill_metadata(cls, seq_lens_tensor, context_lens_tensor,
+                                     num_prefills, num_prefill_tokens,
+                                     slot_mapping, block_list):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
