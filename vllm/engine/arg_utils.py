@@ -119,7 +119,8 @@ class EngineArgs:
     enable_prefix_caching: Optional[bool] = None
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
-    use_padding_aware_scheduling: bool = False
+    use_padding_aware_scheduling: bool = False if \
+        not current_platform.is_hpu() else True
     swap_space: float = 4  # GiB
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
