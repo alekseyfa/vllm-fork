@@ -116,8 +116,8 @@ class LLMEngine:
                 from vllm.v1.executor.uniproc_executor import UniprocExecutor
                 executor_class = UniprocExecutor
         elif current_platform.is_hpu():
-            from vllm.v1.executor.hpu_executor import HPUExecutor
-            executor_class = HPUExecutor
+            from vllm.v1.executor.uniproc_hpu_executor import UniprocHPUExecutor
+            executor_class = UniprocHPUExecutor
 
         return executor_class
 

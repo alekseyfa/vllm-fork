@@ -1084,9 +1084,8 @@ class HPUModelRunner:
         #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
         logprob_token_ids = None
         logprobs = None
-        split_sampler = True
-        prefill_output_device = None
-        decode_output_device = None
+        prefill_output_tokens = []
+        decode_output_tokens = []
 
         ######################### DECODES #########################
         # Decodes run as one single batch with [padded_decode_bs, 1]
@@ -1096,19 +1095,16 @@ class HPUModelRunner:
                 decode_data.token_ids, decode_data.position_ids,
                 decode_data.attn_metadata, decode_data.logits_indices, self.kv_caches)
             htorch.core.mark_step()
-            if split_sampler:
-                sampling_metadata = self._prepare_sampling(
-                    scheduler_output,
-                    start_idx=0,
-                    end_idx=num_decodes,
-                    pad_to=num_padded_decodes)
-                htorch.core.mark_step()
-                sampler_output = self.model.sample(
-                    logits=logits_device, sampling_metadata=sampling_metadata)
-                decode_output_device = sampler_output.sampled_token_ids
-                htorch.core.mark_step()
-            else:
-                decode_output_device = logits_device
+            sampling_metadata = self._prepare_sampling(
+                scheduler_output,
+                start_idx=0,
+                end_idx=num_decodes,
+                pad_to=num_padded_decodes)
+            htorch.core.mark_step()
+            sampler_output = self.model.sample(
+                logits=logits_device, sampling_metadata=sampling_metadata)
+            # sampler now returns cpu list instead of device tensor - and i don't like it
+            decode_output_tokens = sampler_output.sampled_token_ids
             htorch.core.mark_step()
 
         ######################### PREFILLS #########################
@@ -1116,7 +1112,6 @@ class HPUModelRunner:
         if num_prefills > 0:
             prefill_seq_offset_start = num_decodes
             htorch.core.mark_step()
-            prefill_output_list = []
             for idx, (req_id, prompt_len, token_ids, position_ids,
                       attn_metadata,
                       logits_indices) in enumerate(prefill_data.zipped()):
@@ -1124,84 +1119,28 @@ class HPUModelRunner:
                 logits_device = self._execute_model_generic(
                     token_ids, position_ids, attn_metadata, logits_indices, self.kv_caches)
                 htorch.core.mark_step()
-                if split_sampler:
-                    num_curr_prefills = token_ids.shape[0]
-                    prefill_seq_offset_end = prefill_seq_offset_start + num_curr_prefills
-                    if prefill_seq_offset_start == prefill_seq_offset_end:
-                        import pdb; pdb.set_trace()
-                    sampling_metadata = self._prepare_sampling(
-                        scheduler_output,
-                        start_idx=prefill_seq_offset_start,
-                        end_idx=prefill_seq_offset_end,
-                        pad_to=num_curr_prefills)
-                    htorch.core.mark_step()
-                    sampler_output = self.model.sample(
-                        logits=logits_device,
-                        sampling_metadata=sampling_metadata)
-                    sampled_token_ids_device = sampler_output.sampled_token_ids
-                    htorch.core.mark_step()
-                    prefill_seq_offset_end = prefill_seq_offset_start
-                    prefill_output_list.append(sampled_token_ids_device)
-                else:
-                    prefill_output_list.append(logits_device)                    
-            prefill_output_device = torch.cat(prefill_output_list, dim=0)
+                num_curr_prefills = token_ids.shape[0]
+                prefill_seq_offset_end = prefill_seq_offset_start + num_curr_prefills
+                if prefill_seq_offset_start == prefill_seq_offset_end:
+                    import pdb; pdb.set_trace()
+                sampling_metadata = self._prepare_sampling(
+                    scheduler_output,
+                    start_idx=prefill_seq_offset_start,
+                    end_idx=prefill_seq_offset_end,
+                    pad_to=num_curr_prefills)
+                htorch.core.mark_step()
+                sampler_output = self.model.sample(
+                    logits=logits_device,
+                    sampling_metadata=sampling_metadata)
+                sampled_token_ids_device = sampler_output.sampled_token_ids
+                htorch.core.mark_step()
+                prefill_seq_offset_end = prefill_seq_offset_start
+                prefill_output_tokens.extend(sampled_token_ids_device)
+            # sampler now returns cpu list instead of device tensor - and i don't like it
+            # prefill_output_device = torch.cat(prefill_output_list, dim=0)
             htorch.core.mark_step()
 
-        ################### (maybe) SAMPLING ###################
-        #NOTE(kzawora): It might be better to do separate sampling
-        # for prefills and decodes, since they will have more predictable
-        # shapes. Or it might not. Idk. I implemented both.
-        # In my testing, split_sampler=False was a bit faster (Llama3.1-8B@GSM8K),
-        # no differences in accuracy observed. YMMV.
-        # HPU <-> CPU sync happens in this section
-
-        sampled_token_ids_cpu: torch.Tensor
-        if split_sampler:
-            # If sampler was split, we already have tokens. Let's copy the data to CPU as is, and then discard padded tokens.
-            prefill_output_cpu = prefill_output_device.cpu(
-            ) if prefill_output_device is not None else None
-            decode_output_cpu = decode_output_device.cpu(
-            ) if decode_output_device is not None else None
-            # From this point onward, all operations are done on CPU.
-
-            # Discard garbage tokens from prefills and/or decodes
-            if prefill_output_cpu is not None and decode_output_cpu is not None:
-                sampled_token_ids_cpu = torch.cat(
-                    (decode_output_cpu[:num_decodes],
-                     prefill_output_cpu[:num_prefills]),
-                    dim=0)
-            else:
-                sampled_token_ids_cpu = decode_output_cpu[:
-                                                          num_decodes] if decode_output_cpu is not None else prefill_output_cpu[:
-                                                                                                                                num_prefills]
-        else:
-            # If sampler was not split, we need to sample on device before copying to CPU.
-            joint_logits_device: torch.Tensor
-            if decode_output_device is not None and prefill_output_device is not None:
-                joint_logits_device = torch.cat(
-                    (decode_output_device, prefill_output_device), dim=0)
-            else:
-                joint_logits_device = decode_output_device if decode_output_device is not None else prefill_output_device
-            # NOTE(kzawora): this stuff is not gonna work
-            assert False, "imma be real, this ain't gonna work chief"
-            sampled_token_ids_device = torch.argmax(joint_logits_device, dim=1)
-            sampled_token_ids_padded_cpu = sampled_token_ids_device.cpu()
-            # From this point onward, all operations are done on CPU.
-
-            # Discard garbage tokens from prefills and/or decodes
-            # NOTE(kzawora): If we have 3 prefills and 3 decodes, and both
-            # are padded to 4, the sampled tokens tensor looks as follows:
-            # [ D0, D1, D2, 0, P0, P1, P2, 0]
-            #   ^___^___^      ^___^___^
-            # Here, we're selecting these elements and discard the
-            # padding in the middle (after prefill tokens) and at the end of the
-            # tensor (after decode tokens)
-            # https://numpy.org/doc/stable/reference/generated/numpy.r_.html
-            sampled_token_ids_cpu = sampled_token_ids_padded_cpu[
-                np.r_[:num_decodes,
-                      num_padded_decodes:num_padded_decodes + num_prefills]]
-
-        sampled_token_ids_list = sampled_token_ids_cpu.tolist()
+        sampled_token_ids_list = [*decode_output_tokens, *prefill_output_tokens]
         ######### UPDATE REQUEST STATE WITH GENERATED TOKENS #########
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             req_state = self.requests[req_id]
@@ -1216,7 +1155,7 @@ class HPUModelRunner:
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids[:num_reqs],
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids_cpu=sampled_token_ids_cpu,
+            sampled_token_ids=sampled_token_ids_list,
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )

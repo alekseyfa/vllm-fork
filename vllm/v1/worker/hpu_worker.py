@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.distributed
+import vllm.envs as envs
 
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -54,8 +55,23 @@ class HPUWorker:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
+        # Torch profiler. Enabled and configured through env vars:
+        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
+        if envs.VLLM_TORCH_PROFILER_DIR:
+            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+            logger.info("Profiling enabled. Traces will be saved to: %s",
+                        torch_profiler_trace_dir)
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.HPU,
+                ],
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    torch_profiler_trace_dir, use_gzip=True))
+        else:
+            self.profiler = None
 
-        self.model_runner = HPUModelRunner(vllm_config)
 
     def initialize(self):
         # Initialize the distributed environment.
@@ -64,7 +80,7 @@ class HPUWorker:
                                             self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
-
+        self.model_runner = HPUModelRunner(self.vllm_config)
     def load_model(self) -> None:
         self.model_runner.load_model()
 
@@ -170,6 +186,7 @@ class HPUWorker:
         #with track_graph_compile('HPUWorker.execute_model'):
         output = self.model_runner.execute_model(scheduler_output)
         # TODO(woosuk): Send the output to the engine process.
+        return output if self.rank == 0 else None
         return output
 
 
