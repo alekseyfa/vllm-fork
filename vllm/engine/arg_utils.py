@@ -455,7 +455,7 @@ class EngineArgs:
             action='store_true',
             help=('Use padding-aware scheduling. If True, the scheduler '
                   'will consider padded tokens in prefill. '
-                  'By default this is set to False. '))
+                  'By default this is set to False on non-HPU devices. '))
         parser.add_argument(
             '--num-lookahead-slots',
             type=int,
