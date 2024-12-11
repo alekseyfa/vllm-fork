@@ -964,6 +964,17 @@ class LLM:
         outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
         total_in_toks = 0
         total_out_toks = 0
+        WARMUP_STEP =  125
+        ACTIVE_STEP = 2
+
+        hb_profer = HabanaProfile(
+            warmup=WARMUP_STEP, active=ACTIVE_STEP, record_shapes=False
+        )
+        PROFILE=False
+        if PROFILE:
+            hb_profer.start()
+
+            step_count = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
@@ -983,6 +994,14 @@ class LLM:
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
+            if PROFILE:
+                hb_profer.step()
+                step_count = step_count + 1
+                #print("before********",step_count, (ACTIVE_STEP + WARMUP_STEP-1))
+                if step_count == (ACTIVE_STEP + WARMUP_STEP):
+                    print("after********",step_count, (ACTIVE_STEP + WARMUP_STEP))
+                    hb_profer.stop()
+                    exit()
 
         if use_tqdm:
             pbar.close()

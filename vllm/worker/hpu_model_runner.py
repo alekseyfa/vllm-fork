@@ -66,6 +66,79 @@ _PAD_BLOCK_ID = 0
 
 LORA_WARMUP_RANK = 8
 
+import torch
+class HabanaProfile(object):
+    """
+    HPU profiler only could be run once, so HABANA_PROFILE_ENABLED, a class static variable shared by all the instances of HabanaProfile, is used to control which part will be captured.
+    """
+
+    HABANA_PROFILE_ENABLED = True
+
+    def __init__(
+        self,
+        warmup: int = 0,
+        active: int = 0,
+        record_shapes: bool = True,
+        output_dir: str = "./hpu_profile",
+        wait: int = 0,
+    ):
+        if active <= 0 or warmup < 0 or not HabanaProfile.HABANA_PROFILE_ENABLED:
+
+            def noop():
+                pass
+
+            self.start = noop
+            self.stop = noop
+            self.step = noop
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = False
+            schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
+            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
+
+            profiler = torch.profiler.profile(
+                schedule=schedule,
+                activities=activities,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+                record_shapes=record_shapes,
+                with_stack=True,
+            )
+            self.start = profiler.start
+            self.stop = profiler.stop
+            self.step = profiler.step
+            HabanaProfile.enable.invalid = True
+            HabanaProfile.disable.invalid = True
+
+    def stop(self):
+        self.stop()
+ 
+    def start(self):
+        self.start()
+
+    def step(self):
+        self.step()
+
+    @staticmethod
+    def disable():
+        """
+        Runs only once and must happen before doing profiling.
+        """
+        if hasattr(HabanaProfile.disable, "invalid"):
+            if not HabanaProfile.disable.invalid:
+                HabanaProfile.HABANA_PROFILE_ENABLED = False
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = False
+
+    @staticmethod
+    def enable():
+        """
+        Runs only once and must happen before doing profiling.
+        """
+        if hasattr(HabanaProfile.enable, "invalid"):
+            if not HabanaProfile.enable.invalid:
+                HabanaProfile.HABANA_PROFILE_ENABLED = True
+        else:
+            HabanaProfile.HABANA_PROFILE_ENABLED = True
+
 
 def subtuple(obj: object,
              typename: str,
@@ -540,6 +613,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                                 'true').lower() == 'true'
         # For multi-step scheduling
         self.cached_step_outputs: List[torch.Tensor] = []
+
+        #self.warmup_step =  125
+        #self.active_step = 15
+        #self.hb_profer = HabanaProfile(
+        #    warmup=self.warmup_step, active=self.active_step, record_shapes=False
+        #)
+        #self.hb_profer.start()
+        #self.hb_step_count = 0
 
     def _set_gc_threshold(self) -> None:
         # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
@@ -2098,6 +2179,12 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     broadcast_tensor_dict(model_kwargs_broadcast_data, src=0)
                 else:
                     try_revert_dummy_output_tokens()
+
+                #self.hb_profer.step()
+                #self.hb_step_count += 1
+                #if self.hb_step_count == (self.active_step + self.warmup_step):
+                #    self.hb_profer.stop()
+                #    exit()
 
             if self.is_driver_worker and self.profiler.enabled:
                 # Stop recording 'execute_model' event
