@@ -8,7 +8,7 @@ on:
       - '.github/workflows/png-lint.yml'
   pull_request:
     branches:
-      - "main"
+      - "habana_main"
     paths:
       - '*.excalidraw.png'
       - '.github/workflows/png-lint.yml'

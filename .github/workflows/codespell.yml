@@ -15,7 +15,7 @@ on:
       - .github/workflows/codespell.yml
   pull_request:
     branches:
-      - main
+      - habana_main
     paths:
       - "**/*.py"
       - "**/*.md"
