@@ -18,16 +18,11 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
-def create_worker(worker_module_name, worker_class_name, **kwargs):
-    wrapper = WorkerWrapperBase(
-        # worker_module_name="vllm.worker.habana_worker",
-        # worker_class_name="HabanaWorker",
-        worker_module_name=worker_module_name,
-        worker_class_name=worker_class_name,
-    )
+def create_worker(**kwargs):
+    vllm_config = kwargs.get("vllm_config")
+    wrapper = WorkerWrapperBase(vllm_config=vllm_config)
     wrapper.init_worker(**kwargs)
     return wrapper.worker
-
 
 class HPUExecutor(ExecutorBase):
 
@@ -55,17 +50,6 @@ class HPUExecutor(ExecutorBase):
             or (rank % self.parallel_config.tensor_parallel_size == 0),
         )
     
-    def _get_create_worker_kwargs(
-            self,
-            local_rank: int = 0,
-            rank: int = 0,
-            distributed_init_method: Optional[str] = None) -> Dict:
-        worker_kwargs = self._get_worker_kwargs(local_rank, rank,
-                                                distributed_init_method)
-        worker_kwargs.update(worker_module_name="vllm.worker.hpu_worker",
-                             worker_class_name="HPUWorker",)
-        return worker_kwargs
-
     def _create_worker(self,
                        local_rank: int = 0,
                        rank: int = 0,

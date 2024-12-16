@@ -12,11 +12,12 @@ from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
                                                   ResultHandler, WorkerMonitor)
 from vllm.executor.distributed_hpu_executor import ( # yapf: disable
     DistributedHPUExecutor, DistributedHPUExecutorAsync)
-from vllm.utils import (_run_task_with_lock, make_async, get_vllm_instance_id, 
+from vllm.utils import (_run_task_with_lock, make_async, 
                         get_distributed_init_method, get_open_port)
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 import habana_frameworks.torch.hpu as hthpu
+from vllm.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
 
@@ -29,7 +30,7 @@ class MultiprocessingHPUExecutor(DistributedHPUExecutor):
         world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
         # Ensure that VLLM_INSTANCE_ID is set, to be inherited by workers
-        os.environ["VLLM_INSTANCE_ID"] = get_vllm_instance_id()
+        #os.environ["VLLM_INSTANCE_ID"] = get_vllm_instance_id()
         # Disable torch async compiling which won't work with daemonic processes
         os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
         # Configure thread parallelism if OMP_NUM_THREADS isn't set
@@ -72,7 +73,7 @@ class MultiprocessingHPUExecutor(DistributedHPUExecutor):
                     result_handler,
                     partial(
                         create_worker,
-                        **self._get_create_worker_kwargs(
+                        **self._get_worker_kwargs(
                             rank=rank,
                             local_rank=rank,
                             distributed_init_method=distributed_init_method,
