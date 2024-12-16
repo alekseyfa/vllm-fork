@@ -296,11 +296,11 @@ class HpuModelAdapter:
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
 
-        if not is_fake_hpu() and htorch.utils.internal.is_lazy():
+        if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(metadata.block_groups,
                                                         num_classes=batch_size)
         else:
-            # Unfortunately one_hot on CPU/torch.compile mode/eager mode
+            # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
             # all negative values to 0 (block_mapping) or bs (block_groups)
             block_groups = metadata.block_groups.to(torch.long)
@@ -687,7 +687,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 assert hasattr(
                     self.model, "embedding_padding_modules"
                 ), "Model does not have embedding_padding_modules"
-
+                assert not self.lora_config.bias_enabled, \
+                    "Bias support in LoRA is not enabled in HPU yet."
+                assert not self.lora_config.fully_sharded_loras, \
+                    "Fully sharded LoRAs is not enabled in HPU yet."
                 if supports_multimodal(self.model):
                     logger.warning(
                         "Regarding multimodal models, vLLM currently "
