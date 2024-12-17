@@ -24,10 +24,6 @@ class HpuPlatform(Platform):
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         return True
 
-    @staticmethod
-    def inference_mode():
-        return torch.no_grad()
-
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
