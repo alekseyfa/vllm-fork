@@ -1,7 +1,5 @@
 from typing import TYPE_CHECKING, Optional
 
-import torch
-
 from .interface import Platform, PlatformEnum, _Backend
 
 if TYPE_CHECKING:
