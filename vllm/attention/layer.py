@@ -194,7 +194,9 @@ class MultiHeadAttention(nn.Module):
 
         attn_backend_enum = backend_name_to_enum(attn_backend.get_name())
 
-        if attn_backend_enum in {_Backend.FLASH_ATTN, _Backend.FLASH_ATTN_VLLM_V1}:
+        if attn_backend_enum in {
+                _Backend.FLASH_ATTN, _Backend.FLASH_ATTN_VLLM_V1
+        }:
             attn_backend_enum = _Backend.XFORMERS
 
         self.attn_backend = attn_backend_enum if attn_backend_enum in {
@@ -239,7 +241,7 @@ class MultiHeadAttention(nn.Module):
                                                  value,
                                                  scale=self.scale)
             out = out.transpose(1, 2).contiguous()
-        
+
         return out.view(bsz, q_len, -1)
 
 
