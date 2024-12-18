@@ -49,7 +49,7 @@ jobs:
             test_list=$(yq -oj e .jenkins/test_config.yaml  | jq '[.stages[].steps[]]')
             echo "tests_list=$(echo $test_list)" >> $GITHUB_OUTPUT
   TestRun:
-    name: Test /${{matrix.tests.name}}
+    name: Test / ${{matrix.tests.name}}
     needs: [CalculateJobs]
     runs-on: generic-runner
     strategy:
@@ -64,7 +64,7 @@ jobs:
     steps:
         - name: Download Hlctl
           run: |
-            curl --show-error --silent ${{ secrets.HLCTL_ADDRESS }}| bash &> /dev/null
+            curl --show-error --silent ${{ secrets.HLCTL_ADDRESS }} | bash &> /dev/null
             ${{ secrets.HLCTL_COMMAND }} &> /dev/null
         - name: Create Pod Template
           env:
