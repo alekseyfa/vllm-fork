@@ -65,7 +65,7 @@ jobs:
         - name: Download Hlctl
           run: |
             curl --show-error --silent ${{ secrets.HLCTL_ADDRESS }} | bash &> /dev/null
-        - name: Config HlCTL
+        - name: Config Hlctl
           run: |
             ${{ secrets.HLCTL_COMMAND }} &> /dev/null
         - name: Create Pod Template

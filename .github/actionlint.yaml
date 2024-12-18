@@ -3,7 +3,7 @@ self-hosted-runner:
   labels:
     - generic-runner
 paths:
-  .github/workflows/**/*.{yml,yaml}:
+  .github/workflows/trigger_jenkins.yml:
     ignore:
       - shellcheck reported issue in this script: SC2116:.+
       - shellcheck reported issue in this script: SC2086:.+ 
