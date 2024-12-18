@@ -14,6 +14,8 @@ jobs:
         uses: actions/checkout@v4
       - name: 'Dependency Review'
         uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
   CodeQLScan:
     name: CodeQL Scan
     runs-on: ubuntu-latest
@@ -101,7 +103,7 @@ jobs:
             hlctl create containers \
                 --file=pod.yml \
                 --flavor=${{ matrix.tests.flavor}} \
-                --name="github-vllm-fork-${{github.event.number}}-${{github.run_number}}-${converted_test_name}" \
+                --name="vllm-fork-${{github.event.number}}-${converted_test_name}" \
                 --namespace="framework" \
                 --priority="high" \
                 --retry \
