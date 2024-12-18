@@ -71,7 +71,8 @@ jobs:
         - name: Create Pod Template
           env:
             TARGET_BRANCH: ${{ github.base_ref }}
-            RELEASED_SYNAPSE_VERSION: ${{ vars.RELEASED_SYNAPSE_VERSION }}        
+            RELEASED_SYNAPSE_VERSION: ${{ vars.RELEASED_SYNAPSE_VERSION }}
+            BASE_BRANCH: ${{github.head_ref}}      
           run: |
             if [[ $TARGET_BRANCH == 'habana_main' ]]; then
               synapse_version=${RELEASED_SYNAPSE_VERSION#v}
@@ -91,7 +92,7 @@ jobs:
             sed -i "s/##BUILD##/${synapse_build}/g" pod.yml
             sed -i "s/##BUILD_TAG##/${BUILD_TAG}/g" pod.yml
             sed -i "s/##PYTORCH_VERSION##/${pt_version}/g" pod.yml
-            sed -i "s|##GIT_BRANCH##|${{github.head_ref}}|g" pod.yml
+            sed -i "s|##GIT_BRANCH##|$BASE_BRANCH|g" pod.yml
             sed -i "s|##CMD##|$safe_cmd|g" pod.yml
             echo "Pod Template Created"
         - name: Run Test
