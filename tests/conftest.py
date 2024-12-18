@@ -5,7 +5,6 @@ from collections import UserList
 from enum import Enum
 from typing import (Any, Callable, Dict, List, Optional, Tuple, Type,
                     TypedDict, TypeVar, Union)
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -110,7 +109,7 @@ VIDEO_ASSETS = _VideoAssets()
 
 
 @pytest.fixture(params=[True, False])
-def run_with_both_engines(request):
+def run_with_both_engines(request, monkeypatch):
     # Automatically runs tests twice, once with V1 and once without
     use_v1 = request.param
     # Tests decorated with `@skip_v1` are only run without v1
@@ -119,11 +118,11 @@ def run_with_both_engines(request):
     if use_v1:
         if skip_v1:
             pytest.skip("Skipping test on vllm V1")
-        with patch('vllm.envs.VLLM_USE_V1', True):
-            yield
+        monkeypatch.setenv('VLLM_USE_V1', '1')
     else:
-        with patch('vllm.envs.VLLM_USE_V1', False):
-            yield
+        monkeypatch.setenv('VLLM_USE_V1', '0')
+
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -649,6 +648,80 @@ def hf_runner():
     return HfRunner
 
 
+class HfHPURunner(HfRunner):
+
+    def wrap_device(self, x: _T, device: Optional[str] = None) -> _T:
+        if device is None:
+            device = "cpu" if current_platform.is_cpu() else "hpu"
+
+        if isinstance(x, dict):
+            return {k: self.wrap_device(v, device) for k, v in x.items()}
+
+        if hasattr(x, "device") and x.device.type == device:
+            return x
+
+        return x.to(device)
+
+    def __init__(
+        self,
+        model_name: str,
+        dtype: str = "half",
+        *,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        is_embedding_model: bool = False,
+        auto_cls: Type[_BaseAutoModelClass] = AutoModelForCausalLM,
+        postprocess_inputs: Callable[[BatchEncoding],
+                                     BatchEncoding] = identity,
+    ) -> None:
+        torch_dtype = STR_DTYPE_TO_TORCH_DTYPE[dtype]
+
+        self.model_name = model_name
+
+        model_kwargs = model_kwargs if model_kwargs is not None else {}
+        self.model = self.wrap_device(
+            auto_cls.from_pretrained(
+                model_name,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+                **model_kwargs,
+            ).eval())
+
+        from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+        wrap_done = False
+        if hasattr(self.model, "language_model"):
+            self.model.language_model = wrap_in_hpu_graph(
+                self.model.language_model)
+            wrap_done = True
+        if hasattr(self.model, "vision_model"):
+            self.model.vision_model = wrap_in_hpu_graph(
+                self.model.vision_model)
+            wrap_done = True
+        if not wrap_done:
+            self.model = wrap_in_hpu_graph(self.model)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+
+        # don't put this import at the top level
+        # it will call torch.cuda.device_count()
+        from transformers import AutoProcessor  # noqa: F401
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+        self.dtype = dtype
+        self.postprocess_inputs = postprocess_inputs
+
+
+@pytest.fixture(scope="session")
+def hf_hpu_runner():
+    return HfHPURunner
+
+
 class VllmRunner:
 
     def __init__(
@@ -663,7 +736,7 @@ class VllmRunner:
         dtype: str = "half",
         disable_log_stats: bool = True,
         tensor_parallel_size: int = 1,
-        block_size: int = 16,
+        block_size: int = 16 if not current_platform.is_hpu() else 128,
         enable_chunked_prefill: bool = False,
         swap_space: int = 4,
         enforce_eager: Optional[bool] = False,

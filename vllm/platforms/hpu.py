@@ -1,6 +1,4 @@
-from typing import TYPE_CHECKING
-
-import torch
+from typing import TYPE_CHECKING, Optional
 
 from .interface import Platform, PlatformEnum, _Backend
 
@@ -20,9 +18,9 @@ class HpuPlatform(Platform):
     def get_default_attn_backend(cls, selected_backend: _Backend) -> _Backend:
         return _Backend.HPU_ATTN
 
-    @staticmethod
-    def inference_mode():
-        return torch.no_grad()
+    @classmethod
+    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
+        return True
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
