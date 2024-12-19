@@ -58,7 +58,7 @@ $ docker run -it --runtime=habana -e HABANA_VISIBLE_DEVICES=all -e OMPI_MCA_btl_
 
 ### Build and Install vLLM
 
-Currently, multiple repositories are provided which can be used to install vLLM with Intel® Gaudi®, pick **one** option:
+Currently, multiple ways are provided which can be used to install vLLM with Intel® Gaudi®, pick **one** option:
 
 #### 1. Build and Install the stable version
 
