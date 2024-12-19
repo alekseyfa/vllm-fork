@@ -62,7 +62,7 @@ Use the following commands to run a Docker image. Make sure to update the versio
 Build and Install vLLM
 ~~~~~~~~~~~~~~~~~~~~~~
 
-Currently, multiple repositories are provided which can be used to install vLLM with Intel® Gaudi®, pick **one** option:
+Currently, multiple ways are provided which can be used to install vLLM with Intel® Gaudi®, pick **one** option:
 
 .. _1-build-and-install-the-stable-version:
 
