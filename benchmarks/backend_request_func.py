@@ -411,17 +411,28 @@ async def async_request_openai_chat_completions(
                             data = json.loads(chunk)
 
                             if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
+                                delta = choices[0].get("delta", {})
+                                
+                                if "content" in delta and delta["content"] is not None:
+                                    text_piece = delta["content"]
+
+                                # Tool calling
+                                elif "tool_calls" in delta:
+                                    text_piece = json.dumps(delta["tool_calls"], ensure_ascii=False)
+
+                                else:
+                                    text_piece = ""
+
                                 # First token
-                                if ttft == 0.0:
+                                if ttft == 0.0 and text_piece:
                                     ttft = timestamp - st
                                     output.ttft = ttft
 
                                 # Decoding phase
-                                else:
+                                elif text_piece:
                                     output.itl.append(timestamp - most_recent_timestamp)
 
-                                generated_text += content or ""
+                                generated_text += text_piece
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
 
